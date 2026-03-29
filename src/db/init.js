@@ -1,11 +1,20 @@
 import Database from 'better-sqlite3';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
+import { existsSync, mkdirSync } from 'fs';
 import logger from '../utils/logger.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
-const DB_PATH = join(__dirname, '..', '..', 'bot.db');
+const PROJECT_ROOT = join(__dirname, '..', '..');
+
+// Use DATA_DIR env var (Railway volume) or fall back to project root (local dev)
+const DATA_DIR = process.env.DATA_DIR || PROJECT_ROOT;
+if (!existsSync(DATA_DIR)) mkdirSync(DATA_DIR, { recursive: true });
+
+const DB_PATH = join(DATA_DIR, 'bot.db');
+
+export { DB_PATH, DATA_DIR };
 
 let db;
 

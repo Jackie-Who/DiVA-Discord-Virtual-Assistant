@@ -6,15 +6,11 @@
  */
 
 import { copyFileSync, readdirSync, unlinkSync, mkdirSync, existsSync } from 'fs';
-import { join, dirname } from 'path';
-import { fileURLToPath } from 'url';
+import { join } from 'path';
+import { DB_PATH, DATA_DIR } from '../db/init.js';
 import logger from './logger.js';
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = dirname(__filename);
-const PROJECT_ROOT = join(__dirname, '..', '..');
-const DB_PATH = join(PROJECT_ROOT, 'bot.db');
-const BACKUP_DIR = join(PROJECT_ROOT, 'backups');
+const BACKUP_DIR = join(DATA_DIR, 'backups');
 const MAX_BACKUPS = 10;
 
 function ensureBackupDir() {
