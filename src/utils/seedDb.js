@@ -8,7 +8,7 @@
  * DELETE THIS FILE after the seed is confirmed working.
  */
 
-import { existsSync } from 'fs';
+import { existsSync, statSync, unlinkSync } from 'fs';
 import { join } from 'path';
 import { execSync } from 'child_process';
 import logger from './logger.js';
@@ -21,23 +21,31 @@ export function seedDatabaseIfNeeded() {
 
     const dbPath = join(DATA_DIR, 'bot.db');
 
+    // Check if DB exists AND has real data (>8KB means it has personality rows)
+    // A freshly created empty DB is ~4KB
     if (existsSync(dbPath)) {
-        logger.info('Database already exists on volume, skipping seed');
-        return;
+        const size = statSync(dbPath).size;
+        if (size > 8192) {
+            logger.info('Database with data exists on volume, skipping seed', { size });
+            return;
+        }
+        // Empty/fresh DB — delete it so we can replace with the seed
+        logger.info('Empty database found on volume, replacing with seed...', { size });
+        unlinkSync(dbPath);
     }
 
-    logger.info('No database found on volume, downloading seed...');
+    logger.info('Downloading seed database...');
 
     try {
         execSync(`curl -L -o "${dbPath}" "${SEED_URL}"`, { stdio: 'pipe', timeout: 30_000 });
 
         if (existsSync(dbPath)) {
-            logger.info('Database seed downloaded successfully', { path: dbPath });
+            const size = statSync(dbPath).size;
+            logger.info('Database seed downloaded successfully', { path: dbPath, size });
         } else {
             logger.error('Seed download completed but file not found');
         }
     } catch (err) {
         logger.error('Failed to download seed database', { error: err.message });
-        // Bot will still start with a fresh DB — not fatal
     }
 }
