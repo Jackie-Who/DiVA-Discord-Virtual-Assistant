@@ -4,13 +4,14 @@ import { saveMessage } from '../db/history.js';
 import { getPersonality, incrementInteractionCount, shouldRunDigest } from '../db/personality.js';
 import { isBudgetExhausted, isInSavingMode, getBudgetPercent, recordUsage } from '../db/tokenBudget.js';
 import { runPersonalityDigest } from './personality.js';
-import { ADMIN_TOOL_DEFINITIONS, executeAdminTool, isReadOnlyTool, formatToolForConfirmation } from './adminTools.js';
+import { ADMIN_TOOL_DEFINITIONS, executeAdminTool, isReadOnlyTool, formatToolForConfirmation, recordUndoableAction, getUndoableActions, clearUndoActions, executeUndo } from './adminTools.js';
 import config from '../config.js';
 import logger from '../utils/logger.js';
 import { PermissionsBitField, ActionRowBuilder, ButtonBuilder, ButtonStyle, ComponentType } from 'discord.js';
 import { notifyError } from '../utils/errorNotifier.js';
 
 const CONFIRMATION_TIMEOUT_MS = 60_000; // 60 seconds to confirm
+const ADMIN_MAX_TOKENS = 4096; // Higher token limit for admin tool requests to allow multi-step plans
 
 const BUDGET_EXHAUSTED_MESSAGE = "I've used up my thinking budget for this month. I'll be back on the 1st! \u{1F4A4}";
 const SAVING_MODE_WARNING = "\n\n\u26A0\uFE0F *Budget is above 85% for the month — web search and image analysis are disabled to conserve tokens.*";
@@ -130,17 +131,17 @@ async function buildReplyChain(message, client, maxMessages = 3) {
 
 /**
  * Send a confirmation message with buttons for admin tool actions.
- * Returns true if confirmed, false if cancelled or timed out.
+ * Returns { confirmed: boolean, confirmMsgId: string | null }
  */
 async function requestAdminConfirmation(message, toolBlocks) {
-    // Format the proposed actions
     const actionLines = toolBlocks.map(b => formatToolForConfirmation(b.name, b.input));
     const description = actionLines.length === 1
         ? `I'll perform the following action:\n\n${actionLines[0]}`
         : `I'll perform the following **${actionLines.length} actions**:\n\n${actionLines.join('\n')}`;
 
-    const confirmId = `confirm_${message.id}_${Date.now()}`;
-    const cancelId = `cancel_${message.id}_${Date.now()}`;
+    const ts = Date.now();
+    const confirmId = `confirm_${message.id}_${ts}`;
+    const cancelId = `cancel_${message.id}_${ts}`;
 
     const row = new ActionRowBuilder().addComponents(
         new ButtonBuilder()
@@ -156,35 +157,19 @@ async function requestAdminConfirmation(message, toolBlocks) {
     );
 
     const confirmMsg = await message.reply({
-        content: description + `\n\n*Waiting for confirmation... (expires <t:${Math.floor((Date.now() + CONFIRMATION_TIMEOUT_MS) / 1000)}:R>)*`,
+        content: description + `\n\n*Waiting for confirmation... (expires <t:${Math.floor((ts + CONFIRMATION_TIMEOUT_MS) / 1000)}:R>)*`,
         components: [row],
     });
 
     try {
         const interaction = await confirmMsg.awaitMessageComponent({
             componentType: ComponentType.Button,
-            filter: (i) => {
-                // Only the original admin who triggered the command can confirm
-                return i.user.id === message.author.id &&
-                    (i.customId === confirmId || i.customId === cancelId);
-            },
+            filter: (i) => i.user.id === message.author.id && (i.customId === confirmId || i.customId === cancelId),
             time: CONFIRMATION_TIMEOUT_MS,
         });
 
-        // Disable buttons after click
-        const disabledRow = new ActionRowBuilder().addComponents(
-            new ButtonBuilder()
-                .setCustomId(confirmId)
-                .setLabel('Confirm')
-                .setStyle(ButtonStyle.Success)
-                .setEmoji('✅')
-                .setDisabled(true),
-            new ButtonBuilder()
-                .setCustomId(cancelId)
-                .setLabel('Cancel')
-                .setStyle(ButtonStyle.Danger)
-                .setEmoji('❌')
-                .setDisabled(true),
+        const disabledRow = ActionRowBuilder.from(row).setComponents(
+            row.components.map(c => ButtonBuilder.from(c).setDisabled(true))
         );
 
         if (interaction.customId === confirmId) {
@@ -192,41 +177,85 @@ async function requestAdminConfirmation(message, toolBlocks) {
                 content: description + '\n\n✅ **Confirmed** — executing now...',
                 components: [disabledRow],
             });
-            return true;
+            return { confirmed: true, confirmMsgId: confirmMsg.id, confirmMsg, description };
         } else {
             await interaction.update({
                 content: description + '\n\n❌ **Cancelled** — no changes were made.',
                 components: [disabledRow],
             });
-            return false;
+            return { confirmed: false, confirmMsgId: null };
         }
-    } catch (err) {
-        // Timeout — no interaction received
-        const disabledRow = new ActionRowBuilder().addComponents(
-            new ButtonBuilder()
-                .setCustomId(confirmId)
-                .setLabel('Confirm')
-                .setStyle(ButtonStyle.Success)
-                .setEmoji('✅')
-                .setDisabled(true),
-            new ButtonBuilder()
-                .setCustomId(cancelId)
-                .setLabel('Cancel')
-                .setStyle(ButtonStyle.Danger)
-                .setEmoji('❌')
-                .setDisabled(true),
+    } catch {
+        const disabledRow = ActionRowBuilder.from(row).setComponents(
+            row.components.map(c => ButtonBuilder.from(c).setDisabled(true))
         );
-
         try {
             await confirmMsg.edit({
                 content: description + '\n\n⏰ **Timed out** — no changes were made.',
                 components: [disabledRow],
             });
-        } catch {
-            // Message may have been deleted
+        } catch { /* message deleted */ }
+        return { confirmed: false, confirmMsgId: null };
+    }
+}
+
+/**
+ * Add an Undo button to the confirmation message after successful execution.
+ * Listens for the undo click for 5 minutes.
+ */
+async function attachUndoButton(confirmMsg, description, guildId, userId, confirmMsgId, guild) {
+    const undoId = `undo_${confirmMsgId}_${Date.now()}`;
+    const UNDO_TIMEOUT = 5 * 60_000; // 5 minutes to undo
+
+    const undoRow = new ActionRowBuilder().addComponents(
+        new ButtonBuilder()
+            .setCustomId(undoId)
+            .setLabel('Undo')
+            .setStyle(ButtonStyle.Secondary)
+            .setEmoji('↩️'),
+    );
+
+    try {
+        await confirmMsg.edit({
+            content: description + '\n\n✅ **Done** — actions completed successfully.',
+            components: [undoRow],
+        });
+
+        const interaction = await confirmMsg.awaitMessageComponent({
+            componentType: ComponentType.Button,
+            filter: (i) => i.user.id === userId && i.customId === undoId,
+            time: UNDO_TIMEOUT,
+        });
+
+        // User clicked undo
+        const actions = getUndoableActions(guildId, userId, confirmMsgId);
+        if (!actions || actions.length === 0) {
+            await interaction.update({ content: description + '\n\n⚠️ Nothing to undo.', components: [] });
+            return;
         }
 
-        return false;
+        const results = [];
+        for (const action of actions) {
+            const result = await executeUndo(guild, userId, action);
+            results.push(`${result.success ? '✅' : '❌'} ${result.message}`);
+        }
+
+        clearUndoActions(guildId, userId, confirmMsgId);
+        await interaction.update({
+            content: description + `\n\n↩️ **Undo complete:**\n${results.join('\n')}`,
+            components: [],
+        });
+
+        logger.info('Admin undo executed', { guild: guildId, user: userId, undone: actions.length });
+    } catch {
+        // Timeout — remove the undo button
+        try {
+            await confirmMsg.edit({
+                content: description + '\n\n✅ **Done** — actions completed successfully.',
+                components: [],
+            });
+        } catch { /* message deleted */ }
+        clearUndoActions(guildId, userId, confirmMsgId);
     }
 }
 
@@ -298,9 +327,12 @@ export async function chat(message, client) {
     }
 
     try {
+        // Use higher max_tokens for admin requests to allow multi-step tool plans
+        const effectiveMaxTokens = memberIsAdmin ? ADMIN_MAX_TOKENS : config.maxResponseTokens;
+
         const apiParams = {
             model: 'claude-sonnet-4-6',
-            max_tokens: config.maxResponseTokens,
+            max_tokens: effectiveMaxTokens,
             system: [
                 {
                     type: 'text',
@@ -322,6 +354,8 @@ export async function chat(message, client) {
 
         // Tool use loop — handle admin tool calls with confirmation
         let rounds = 0;
+        const undoButtonPromises = []; // fire-and-forget undo listeners
+
         while (response.stop_reason === 'tool_use' && rounds < MAX_TOOL_ROUNDS) {
             rounds++;
 
@@ -348,9 +382,11 @@ export async function chat(message, client) {
 
             // Write tools need confirmation
             if (writeBlocks.length > 0) {
-                const confirmed = await requestAdminConfirmation(message, writeBlocks);
+                const { confirmed, confirmMsgId, confirmMsg: cMsg, description } = await requestAdminConfirmation(message, writeBlocks);
 
                 if (confirmed) {
+                    let hasUndoableActions = false;
+
                     for (const toolUse of writeBlocks) {
                         const result = await executeAdminTool(toolUse.name, toolUse.input, message.guild, userId);
                         toolResults.push({
@@ -358,9 +394,28 @@ export async function chat(message, client) {
                             tool_use_id: toolUse.id,
                             content: result.message,
                         });
+
+                        // Record undo metadata
+                        if (result.undo) {
+                            recordUndoableAction(guildId, userId, confirmMsgId, result.undo);
+                            hasUndoableActions = true;
+                        }
+                        if (result.undoMulti) {
+                            for (const u of result.undoMulti) {
+                                recordUndoableAction(guildId, userId, confirmMsgId, u);
+                            }
+                            hasUndoableActions = true;
+                        }
+                    }
+
+                    // Attach undo button (fire-and-forget, don't block the response)
+                    if (hasUndoableActions && cMsg) {
+                        undoButtonPromises.push(
+                            attachUndoButton(cMsg, description, guildId, userId, confirmMsgId, message.guild)
+                                .catch(err => logger.error('Undo button error', { error: err.message }))
+                        );
                     }
                 } else {
-                    // User cancelled — return cancellation results
                     for (const toolUse of writeBlocks) {
                         toolResults.push({
                             type: 'tool_result',
@@ -376,6 +431,9 @@ export async function chat(message, client) {
             // Send tool results back to get the final response
             messages.push({ role: 'assistant', content: response.content });
             messages.push({ role: 'user', content: toolResults });
+
+            // Re-send typing indicator between rounds
+            await message.channel.sendTyping();
 
             response = await anthropic.messages.create(apiParams);
             totalInput += response.usage.input_tokens;

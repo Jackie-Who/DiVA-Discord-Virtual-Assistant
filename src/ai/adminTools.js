@@ -100,9 +100,25 @@ const PERMISSION_MAP = {
 
 function resolvePermissions(names) {
     if (!names || !Array.isArray(names)) return [];
-    return names
-        .map(n => PERMISSION_MAP[n.toLowerCase().replace(/[\s_]/g, '')])
-        .filter(Boolean);
+    const resolved = [];
+    for (const name of names) {
+        const key = name.toLowerCase().replace(/[\s_\-]/g, '');
+        // Try direct match first
+        if (PERMISSION_MAP[key]) {
+            resolved.push(PERMISSION_MAP[key]);
+            continue;
+        }
+        // Try matching by PermissionFlagsBits key name (e.g., "ViewChannel", "SendMessages")
+        const flagEntry = Object.entries(PermissionFlagsBits).find(
+            ([k]) => k.toLowerCase() === key
+        );
+        if (flagEntry) {
+            resolved.push(flagEntry[1]);
+            continue;
+        }
+        logger.warn('Unknown permission name, skipping', { name, normalized: key });
+    }
+    return resolved;
 }
 
 // ── Tool definitions sent to the Anthropic API ──
@@ -458,6 +474,122 @@ export const ADMIN_TOOL_DEFINITIONS = [
 
 const READ_ONLY_TOOLS = new Set(['list_channels', 'list_roles']);
 
+// ── Undo action history (in-memory, per-guild, per-user) ──
+// Map<`${guildId}:${userId}`, { actions: [...], confirmMsgId: string }>
+
+const undoHistory = new Map();
+const MAX_UNDO_ACTIONS = 20; // max undoable actions per entry
+
+/**
+ * Record an executed admin action for potential undo.
+ */
+export function recordUndoableAction(guildId, userId, confirmMsgId, action) {
+    const key = `${guildId}:${userId}`;
+    if (!undoHistory.has(key)) {
+        undoHistory.set(key, {});
+    }
+    const history = undoHistory.get(key);
+    if (!history[confirmMsgId]) {
+        history[confirmMsgId] = [];
+    }
+    history[confirmMsgId].push(action);
+
+    // Cap size
+    const allKeys = Object.keys(history);
+    while (allKeys.length > MAX_UNDO_ACTIONS) {
+        delete history[allKeys.shift()];
+    }
+}
+
+/**
+ * Get undoable actions for a specific confirmation message.
+ */
+export function getUndoableActions(guildId, userId, confirmMsgId) {
+    const key = `${guildId}:${userId}`;
+    const history = undoHistory.get(key);
+    if (!history) return null;
+    return history[confirmMsgId] || null;
+}
+
+/**
+ * Remove undo history for a confirmation message (after undo completes).
+ */
+export function clearUndoActions(guildId, userId, confirmMsgId) {
+    const key = `${guildId}:${userId}`;
+    const history = undoHistory.get(key);
+    if (history) {
+        delete history[confirmMsgId];
+    }
+}
+
+/**
+ * Execute the reverse of an admin action.
+ */
+export async function executeUndo(guild, userId, action) {
+    // Re-verify admin permissions
+    if (!isStillAdmin(guild, userId)) {
+        return { success: false, message: 'You no longer have admin permissions.' };
+    }
+
+    try {
+        switch (action.type) {
+            case 'created_channel': {
+                const channel = guild.channels.cache.get(action.channelId);
+                if (!channel) return { success: false, message: `Channel already deleted.` };
+                await channel.delete(`Undo by <@${userId}>`);
+                logger.info('Undo: channel deleted', { guild: guild.id, user: userId, channel: action.channelName });
+                return { success: true, message: `Deleted channel **${action.channelName}**.` };
+            }
+            case 'created_role': {
+                const role = guild.roles.cache.get(action.roleId);
+                if (!role) return { success: false, message: `Role already deleted.` };
+                await role.delete(`Undo by <@${userId}>`);
+                logger.info('Undo: role deleted', { guild: guild.id, user: userId, role: action.roleName });
+                return { success: true, message: `Deleted role **${action.roleName}**.` };
+            }
+            case 'assigned_role': {
+                const member = guild.members.cache.get(action.memberId) || await guild.members.fetch(action.memberId).catch(() => null);
+                if (!member) return { success: false, message: `Member not found.` };
+                const role = guild.roles.cache.get(action.roleId);
+                if (!role) return { success: false, message: `Role not found.` };
+                await member.roles.remove(role, `Undo by <@${userId}>`);
+                return { success: true, message: `Removed role **${action.roleName}** from **${action.memberName}**.` };
+            }
+            case 'removed_role': {
+                const member = guild.members.cache.get(action.memberId) || await guild.members.fetch(action.memberId).catch(() => null);
+                if (!member) return { success: false, message: `Member not found.` };
+                const role = guild.roles.cache.get(action.roleId);
+                if (!role) return { success: false, message: `Role not found.` };
+                await member.roles.add(role, `Undo by <@${userId}>`);
+                return { success: true, message: `Re-assigned role **${action.roleName}** to **${action.memberName}**.` };
+            }
+            case 'created_thread': {
+                const thread = guild.channels.cache.get(action.threadId);
+                if (!thread) return { success: false, message: `Thread not found.` };
+                await thread.delete(`Undo by <@${userId}>`);
+                return { success: true, message: `Deleted thread **${action.threadName}**.` };
+            }
+            case 'created_emoji': {
+                const emoji = guild.emojis.cache.get(action.emojiId);
+                if (!emoji) return { success: false, message: `Emoji not found.` };
+                await emoji.delete(`Undo by <@${userId}>`);
+                return { success: true, message: `Deleted emoji **:${action.emojiName}:**.` };
+            }
+            case 'set_nickname': {
+                const member = guild.members.cache.get(action.memberId) || await guild.members.fetch(action.memberId).catch(() => null);
+                if (!member) return { success: false, message: `Member not found.` };
+                await member.setNickname(action.previousNickname || null, `Undo by <@${userId}>`);
+                return { success: true, message: `Reverted nickname for **${action.memberName}**.` };
+            }
+            default:
+                return { success: false, message: `Cannot undo action type: ${action.type}` };
+        }
+    } catch (error) {
+        logger.error('Undo failed', { type: action.type, error: error.message });
+        return { success: false, message: `Failed to undo: ${error.message}` };
+    }
+}
+
 /**
  * Check if a tool is read-only (info/listing only, no server changes).
  */
@@ -615,7 +747,7 @@ export async function executeAdminTool(toolName, input, guild, userId) {
                 if (input.nsfw != null) opts.nsfw = !!input.nsfw;
                 const ch = await guild.channels.create(opts);
                 logger.info('Admin tool: text channel created', { guild: guild.id, user: userId, channel: ch.name });
-                return { success: true, message: `Text channel #${ch.name} created${parent ? ` under ${parent.name}` : ''}.` };
+                return { success: true, message: `Text channel #${ch.name} created${parent ? ` under ${parent.name}` : ''}.`, undo: { type: 'created_channel', channelId: ch.id, channelName: ch.name } };
             }
 
             case 'create_voice_channel': {
@@ -631,7 +763,7 @@ export async function executeAdminTool(toolName, input, guild, userId) {
                 if (input.bitrate != null) opts.bitrate = Math.max(8000, Math.min(384000, input.bitrate));
                 const ch = await guild.channels.create(opts);
                 logger.info('Admin tool: voice channel created', { guild: guild.id, user: userId, channel: ch.name });
-                return { success: true, message: `Voice channel "${ch.name}" created${parent ? ` under ${parent.name}` : ''}.` };
+                return { success: true, message: `Voice channel "${ch.name}" created${parent ? ` under ${parent.name}` : ''}.`, undo: { type: 'created_channel', channelId: ch.id, channelName: ch.name } };
             }
 
             case 'create_category': {
@@ -639,7 +771,7 @@ export async function executeAdminTool(toolName, input, guild, userId) {
                 if (!v.valid) return { success: false, message: v.error };
                 const cat = await guild.channels.create({ name: v.value, type: ChannelType.GuildCategory });
                 logger.info('Admin tool: category created', { guild: guild.id, user: userId, category: cat.name });
-                return { success: true, message: `Category "${cat.name}" created.` };
+                return { success: true, message: `Category "${cat.name}" created.`, undo: { type: 'created_channel', channelId: cat.id, channelName: cat.name } };
             }
 
             case 'create_announcement_channel': {
@@ -655,7 +787,7 @@ export async function executeAdminTool(toolName, input, guild, userId) {
                 if (topic.value) opts.topic = topic.value;
                 const ch = await guild.channels.create(opts);
                 logger.info('Admin tool: announcement channel created', { guild: guild.id, user: userId, channel: ch.name });
-                return { success: true, message: `Announcement channel #${ch.name} created.` };
+                return { success: true, message: `Announcement channel #${ch.name} created.`, undo: { type: 'created_channel', channelId: ch.id, channelName: ch.name } };
             }
 
             case 'create_stage_channel': {
@@ -668,7 +800,7 @@ export async function executeAdminTool(toolName, input, guild, userId) {
                     parent: parent?.id || null,
                 });
                 logger.info('Admin tool: stage channel created', { guild: guild.id, user: userId, channel: ch.name });
-                return { success: true, message: `Stage channel "${ch.name}" created.` };
+                return { success: true, message: `Stage channel "${ch.name}" created.`, undo: { type: 'created_channel', channelId: ch.id, channelName: ch.name } };
             }
 
             case 'create_forum_channel': {
@@ -684,7 +816,7 @@ export async function executeAdminTool(toolName, input, guild, userId) {
                 if (topic.value) opts.topic = topic.value;
                 const ch = await guild.channels.create(opts);
                 logger.info('Admin tool: forum channel created', { guild: guild.id, user: userId, channel: ch.name });
-                return { success: true, message: `Forum channel #${ch.name} created.` };
+                return { success: true, message: `Forum channel #${ch.name} created.`, undo: { type: 'created_channel', channelId: ch.id, channelName: ch.name } };
             }
 
             // ── Channel Editing ──
@@ -766,7 +898,7 @@ export async function executeAdminTool(toolName, input, guild, userId) {
                 if (input.permissions) opts.permissions = resolvePermissions(input.permissions);
                 const role = await guild.roles.create(opts);
                 logger.info('Admin tool: role created', { guild: guild.id, user: userId, role: role.name });
-                return { success: true, message: `Role "${role.name}" created.` };
+                return { success: true, message: `Role "${role.name}" created.`, undo: { type: 'created_role', roleId: role.id, roleName: role.name } };
             }
 
             case 'edit_role': {
@@ -799,7 +931,8 @@ export async function executeAdminTool(toolName, input, guild, userId) {
                 await member.roles.add(roles);
                 const names = roles.map(r => r.name).join(', ');
                 logger.info('Admin tool: roles assigned', { guild: guild.id, user: userId, target: member.user.username, roles: names });
-                return { success: true, message: `Assigned role(s) ${names} to ${member.displayName}.` };
+                const undoActions = roles.map(r => ({ type: 'assigned_role', memberId: member.id, memberName: member.displayName, roleId: r.id, roleName: r.name }));
+                return { success: true, message: `Assigned role(s) ${names} to ${member.displayName}.`, undoMulti: undoActions };
             }
 
             case 'remove_role': {
@@ -810,7 +943,8 @@ export async function executeAdminTool(toolName, input, guild, userId) {
                 await member.roles.remove(roles);
                 const names = roles.map(r => r.name).join(', ');
                 logger.info('Admin tool: roles removed', { guild: guild.id, user: userId, target: member.user.username, roles: names });
-                return { success: true, message: `Removed role(s) ${names} from ${member.displayName}.` };
+                const undoActions = roles.map(r => ({ type: 'removed_role', memberId: member.id, memberName: member.displayName, roleId: r.id, roleName: r.name }));
+                return { success: true, message: `Removed role(s) ${names} from ${member.displayName}.`, undoMulti: undoActions };
             }
 
             // ── Server Settings ──
@@ -854,7 +988,7 @@ export async function executeAdminTool(toolName, input, guild, userId) {
                 if (input.auto_archive_minutes) opts.autoArchiveDuration = input.auto_archive_minutes;
                 const thread = await channel.threads.create(opts);
                 logger.info('Admin tool: thread created', { guild: guild.id, user: userId, thread: thread.name });
-                return { success: true, message: `Thread "${thread.name}" created in #${channel.name}.` };
+                return { success: true, message: `Thread "${thread.name}" created in #${channel.name}.`, undo: { type: 'created_thread', threadId: thread.id, threadName: thread.name } };
             }
 
             case 'archive_thread': {
@@ -878,7 +1012,7 @@ export async function executeAdminTool(toolName, input, guild, userId) {
             case 'create_emoji': {
                 const emoji = await guild.emojis.create({ attachment: input.image_url, name: input.name });
                 logger.info('Admin tool: emoji created', { guild: guild.id, user: userId, emoji: emoji.name });
-                return { success: true, message: `Emoji :${emoji.name}: created.` };
+                return { success: true, message: `Emoji :${emoji.name}: created.`, undo: { type: 'created_emoji', emojiId: emoji.id, emojiName: emoji.name } };
             }
 
             case 'rename_emoji': {
@@ -926,9 +1060,10 @@ export async function executeAdminTool(toolName, input, guild, userId) {
             case 'set_nickname': {
                 const member = await findMember(guild, input.username);
                 if (!member) return { success: false, message: `Member "${input.username}" not found.` };
+                const previousNickname = member.nickname;
                 await member.setNickname(input.nickname || null);
                 logger.info('Admin tool: nickname set', { guild: guild.id, user: userId, target: member.user.username, nickname: input.nickname });
-                return { success: true, message: input.nickname ? `Nickname for ${member.user.username} set to "${input.nickname}".` : `Nickname cleared for ${member.user.username}.` };
+                return { success: true, message: input.nickname ? `Nickname for ${member.user.username} set to "${input.nickname}".` : `Nickname cleared for ${member.user.username}.`, undo: { type: 'set_nickname', memberId: member.id, memberName: member.user.username, previousNickname } };
             }
 
             // ── Info / Listing ──

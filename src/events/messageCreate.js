@@ -52,14 +52,14 @@ export default function messageCreate(client) {
             await message.channel.sendTyping();
             const response = await chat(message, client);
 
-            // Discord has a 2000 character limit per message, max 3 messages total
+            // Discord has a 2000 character limit per message
+            // Split into as many messages as needed, max 6 to prevent spam
             const MAX_CHARS = 2000;
-            const MAX_MESSAGES = 3;
+            const MAX_MESSAGES = 6;
 
             if (response.length <= MAX_CHARS) {
                 await message.reply(response);
             } else {
-                // Split on newlines or spaces to avoid cutting mid-word
                 const chunks = [];
                 let remaining = response;
                 while (remaining.length > 0 && chunks.length < MAX_MESSAGES) {
@@ -67,16 +67,33 @@ export default function messageCreate(client) {
                         chunks.push(remaining);
                         remaining = '';
                     } else {
-                        // Find a good split point (newline or space near the limit)
-                        let splitAt = remaining.lastIndexOf('\n', MAX_CHARS);
-                        if (splitAt < MAX_CHARS * 0.5) splitAt = remaining.lastIndexOf(' ', MAX_CHARS);
-                        if (splitAt < MAX_CHARS * 0.5) splitAt = MAX_CHARS;
+                        // Find a good split point — prefer code block boundaries, then newlines, then spaces
+                        let splitAt = -1;
+
+                        // Try to avoid splitting inside code blocks
+                        const codeBlockEnd = remaining.lastIndexOf('\n```', MAX_CHARS);
+                        if (codeBlockEnd > MAX_CHARS * 0.3) {
+                            splitAt = codeBlockEnd + 4; // After the closing ```
+                        }
+
+                        if (splitAt < MAX_CHARS * 0.3) {
+                            splitAt = remaining.lastIndexOf('\n\n', MAX_CHARS);
+                        }
+                        if (splitAt < MAX_CHARS * 0.3) {
+                            splitAt = remaining.lastIndexOf('\n', MAX_CHARS);
+                        }
+                        if (splitAt < MAX_CHARS * 0.3) {
+                            splitAt = remaining.lastIndexOf(' ', MAX_CHARS);
+                        }
+                        if (splitAt < MAX_CHARS * 0.3) {
+                            splitAt = MAX_CHARS;
+                        }
+
                         chunks.push(remaining.slice(0, splitAt));
                         remaining = remaining.slice(splitAt).trimStart();
                     }
                 }
                 if (remaining.length > 0) {
-                    // Truncate with indicator if we hit the message cap
                     chunks[chunks.length - 1] = chunks[chunks.length - 1].slice(0, MAX_CHARS - 30) + '\n\n*(response truncated)*';
                 }
                 await message.reply(chunks[0]);
