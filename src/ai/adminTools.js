@@ -2,6 +2,7 @@ import { ChannelType, PermissionFlagsBits, PermissionsBitField, ThreadAutoArchiv
 import logger from '../utils/logger.js';
 import { notifyError } from '../utils/errorNotifier.js';
 import { checkAdminRateLimit, recordAdminToolCall } from '../utils/adminRateLimiter.js';
+import { getDb } from '../db/init.js';
 
 // ── Input sanitization ──
 
@@ -477,48 +478,54 @@ const READ_ONLY_TOOLS = new Set(['list_channels', 'list_roles']);
 // ── Undo action history (in-memory, per-guild, per-user) ──
 // Map<`${guildId}:${userId}`, { actions: [...], confirmMsgId: string }>
 
-const undoHistory = new Map();
-const MAX_UNDO_ACTIONS = 20; // max undoable actions per entry
+const UNDO_TTL_MINUTES = 10; // Undo actions expire after 10 minutes
 
 /**
- * Record an executed admin action for potential undo.
+ * Record an executed admin action for potential undo (persisted to SQLite).
  */
 export function recordUndoableAction(guildId, userId, confirmMsgId, action) {
-    const key = `${guildId}:${userId}`;
-    if (!undoHistory.has(key)) {
-        undoHistory.set(key, {});
-    }
-    const history = undoHistory.get(key);
-    if (!history[confirmMsgId]) {
-        history[confirmMsgId] = [];
-    }
-    history[confirmMsgId].push(action);
-
-    // Cap size
-    const allKeys = Object.keys(history);
-    while (allKeys.length > MAX_UNDO_ACTIONS) {
-        delete history[allKeys.shift()];
-    }
+    const db = getDb();
+    db.prepare(`
+        INSERT INTO undo_actions (guild_id, user_id, confirm_msg_id, action_json)
+        VALUES (?, ?, ?, ?)
+    `).run(guildId, userId, confirmMsgId, JSON.stringify(action));
 }
 
 /**
  * Get undoable actions for a specific confirmation message.
  */
 export function getUndoableActions(guildId, userId, confirmMsgId) {
-    const key = `${guildId}:${userId}`;
-    const history = undoHistory.get(key);
-    if (!history) return null;
-    return history[confirmMsgId] || null;
+    const db = getDb();
+    const rows = db.prepare(`
+        SELECT action_json FROM undo_actions
+        WHERE guild_id = ? AND user_id = ? AND confirm_msg_id = ?
+            AND created_at > datetime('now', ?)
+        ORDER BY id ASC
+    `).all(guildId, userId, confirmMsgId, `-${UNDO_TTL_MINUTES} minutes`);
+    if (rows.length === 0) return null;
+    return rows.map(r => JSON.parse(r.action_json));
 }
 
 /**
- * Remove undo history for a confirmation message (after undo completes).
+ * Remove undo history for a confirmation message (after undo completes or expires).
  */
 export function clearUndoActions(guildId, userId, confirmMsgId) {
-    const key = `${guildId}:${userId}`;
-    const history = undoHistory.get(key);
-    if (history) {
-        delete history[confirmMsgId];
+    const db = getDb();
+    db.prepare(`
+        DELETE FROM undo_actions WHERE guild_id = ? AND user_id = ? AND confirm_msg_id = ?
+    `).run(guildId, userId, confirmMsgId);
+}
+
+/**
+ * Clean up expired undo actions (called periodically).
+ */
+export function cleanupExpiredUndoActions() {
+    const db = getDb();
+    const result = db.prepare(`
+        DELETE FROM undo_actions WHERE created_at < datetime('now', ?)
+    `).run(`-${UNDO_TTL_MINUTES} minutes`);
+    if (result.changes > 0) {
+        logger.debug('Cleaned up expired undo actions', { deleted: result.changes });
     }
 }
 

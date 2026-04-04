@@ -5,6 +5,7 @@ import ban from '../commands/ban.js';
 import kick from '../commands/kick.js';
 import purge from '../commands/purge.js';
 import budget from '../commands/budget.js';
+import personality from '../commands/personality.js';
 
 const commands = {
     'create-channel': createChannel,
@@ -13,6 +14,7 @@ const commands = {
     kick,
     purge,
     budget,
+    personality,
 };
 
 export default function interactionCreate(client) {

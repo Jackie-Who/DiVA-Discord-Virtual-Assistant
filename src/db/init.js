@@ -71,6 +71,18 @@ function initTables() {
             interaction_count INTEGER DEFAULT 0,
             last_digest_at DATETIME DEFAULT CURRENT_TIMESTAMP
         );
+
+        CREATE TABLE IF NOT EXISTS undo_actions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            guild_id TEXT NOT NULL,
+            user_id TEXT NOT NULL,
+            confirm_msg_id TEXT NOT NULL,
+            action_json TEXT NOT NULL,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_undo_actions_lookup
+        ON undo_actions(guild_id, user_id, confirm_msg_id);
     `);
 }
 

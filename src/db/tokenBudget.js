@@ -2,8 +2,12 @@ import { getDb } from './init.js';
 import config from '../config.js';
 import logger from '../utils/logger.js';
 
-const INPUT_COST_PER_MILLION = 3;
-const OUTPUT_COST_PER_MILLION = 15;
+// Model pricing tiers (USD per million tokens)
+const MODEL_PRICING = {
+    'claude-sonnet-4-6':        { input: 3,  output: 15 },
+    'claude-haiku-4-5-20251001': { input: 1,  output: 5 },
+};
+const DEFAULT_PRICING = { input: 3, output: 15 }; // fallback to Sonnet pricing
 
 export function getMonthKey() {
     const now = new Date();
@@ -12,10 +16,11 @@ export function getMonthKey() {
     return `${year}-${month}`;
 }
 
-export function recordUsage(guildId, userId, inputTokens, outputTokens) {
+export function recordUsage(guildId, userId, inputTokens, outputTokens, model) {
     const db = getDb();
-    const costUsd = (inputTokens / 1_000_000 * INPUT_COST_PER_MILLION) +
-                    (outputTokens / 1_000_000 * OUTPUT_COST_PER_MILLION);
+    const pricing = MODEL_PRICING[model] || DEFAULT_PRICING;
+    const costUsd = (inputTokens / 1_000_000 * pricing.input) +
+                    (outputTokens / 1_000_000 * pricing.output);
     const monthKey = getMonthKey();
 
     db.prepare(`

@@ -4,6 +4,7 @@ import logger from './utils/logger.js';
 import { initErrorNotifier, notifyError } from './utils/errorNotifier.js';
 import { getDb } from './db/init.js';
 import { startBackupScheduler } from './utils/backup.js';
+import { cleanupExpiredUndoActions } from './ai/adminTools.js';
 import { initWeeklyMetrics } from './utils/weeklyMetrics.js';
 import ready from './events/ready.js';
 import messageCreate from './events/messageCreate.js';
@@ -22,6 +23,9 @@ getDb();
 
 // Start daily DB backup scheduler (10-day retention)
 startBackupScheduler();
+
+// Clean up expired undo actions every 5 minutes
+setInterval(() => cleanupExpiredUndoActions(), 5 * 60_000);
 
 // Create Discord client
 const client = new Client({

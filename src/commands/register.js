@@ -52,6 +52,17 @@ const commands = [
     new SlashCommandBuilder()
         .setName('budget')
         .setDescription('Check the bot\'s monthly API token budget'),
+
+    new SlashCommandBuilder()
+        .setName('personality')
+        .setDescription('View or reset the bot\'s evolved personality for this server')
+        .addSubcommand(sub =>
+            sub.setName('view').setDescription('View the current personality prompt')
+        )
+        .addSubcommand(sub =>
+            sub.setName('reset').setDescription('Reset the personality to start fresh')
+        )
+        .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
 ];
 
 const rest = new REST({ version: '10' }).setToken(config.discordToken);

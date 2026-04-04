@@ -41,8 +41,9 @@ export async function runPersonalityDigest(guildId) {
             .map(i => `${i.userName}: ${i.userMessage}\nBot: ${i.botResponse}`)
             .join('\n---\n');
 
+        const digestModel = 'claude-haiku-4-5-20251001';
         const response = await anthropic.messages.create({
-            model: 'claude-sonnet-4-6',
+            model: digestModel,
             max_tokens: 256,
             system: DIGEST_SYSTEM_PROMPT,
             messages: [{
@@ -52,7 +53,7 @@ export async function runPersonalityDigest(guildId) {
         });
 
         const { input_tokens, output_tokens } = response.usage;
-        recordUsage(guildId, 'system-digest', input_tokens, output_tokens);
+        recordUsage(guildId, 'system-digest', input_tokens, output_tokens, digestModel);
 
         let newPersonality = response.content[0].text.trim();
         if (newPersonality.length > 500) {

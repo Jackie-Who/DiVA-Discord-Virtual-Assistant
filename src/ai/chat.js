@@ -1,6 +1,6 @@
 import anthropic from './client.js';
 import { buildSystemPrompt } from './systemPrompt.js';
-import { saveMessage } from '../db/history.js';
+import { saveMessage, getRecentHistory, getChannelMemory } from '../db/history.js';
 import { getPersonality, incrementInteractionCount, shouldRunDigest } from '../db/personality.js';
 import { isBudgetExhausted, isInSavingMode, getBudgetPercent, recordUsage } from '../db/tokenBudget.js';
 import { runPersonalityDigest } from './personality.js';
@@ -9,15 +9,38 @@ import config from '../config.js';
 import logger from '../utils/logger.js';
 import { PermissionsBitField, ActionRowBuilder, ButtonBuilder, ButtonStyle, ComponentType } from 'discord.js';
 import { notifyError } from '../utils/errorNotifier.js';
+import { checkAdminRateLimit, recordAdminToolCall } from '../utils/adminRateLimiter.js';
 
 const CONFIRMATION_TIMEOUT_MS = 60_000; // 60 seconds to confirm
 const ADMIN_MAX_TOKENS = 4096; // Higher token limit for admin tool requests to allow multi-step plans
+
+// Model routing — Haiku for simple messages, Sonnet for complex
+const MODEL_SONNET = 'claude-sonnet-4-6';
+const MODEL_HAIKU = 'claude-haiku-4-5-20251001';
+const COMPLEX_INDICATORS = /\b(explain|analyze|compare|how does|why does|write|code|debug|review|create|help me|build|implement|summarize|describe|what happened|tell me about)\b/i;
+const SIMPLE_MAX_LENGTH = 200; // Messages under this length with no complex indicators use Haiku
 
 const BUDGET_EXHAUSTED_MESSAGE = "I've used up my thinking budget for this month. I'll be back on the 1st! \u{1F4A4}";
 const SAVING_MODE_WARNING = "\n\n\u26A0\uFE0F *Budget is above 85% for the month — web search and image analysis are disabled to conserve tokens.*";
 const MAX_TOOL_ROUNDS = 3;
 
 const IMAGE_EXTENSIONS = new Set(['png', 'jpg', 'jpeg', 'gif', 'webp']);
+
+/**
+ * Choose the right model based on message complexity.
+ * Sonnet for: admin requests, images, long/complex messages, web search likely needed.
+ * Haiku for: short, simple, conversational messages.
+ */
+function chooseModel({ text, hasImages, isAdmin, hasTools }) {
+    // Always use Sonnet for admin tool requests and image analysis
+    if (isAdmin || hasImages) return MODEL_SONNET;
+
+    // Long messages or complex questions → Sonnet
+    if (text.length > SIMPLE_MAX_LENGTH || COMPLEX_INDICATORS.test(text)) return MODEL_SONNET;
+
+    // Short, simple, conversational → Haiku
+    return MODEL_HAIKU;
+}
 
 function getImageAttachments(message) {
     const images = [];
@@ -286,7 +309,11 @@ export async function chat(message, client) {
     // Build reply chain context (includes images from chain)
     const isReply = !!message.reference;
     const replyChain = isReply ? await buildReplyChain(message, client) : { messages: [], images: [] };
-    const history = replyChain.messages;
+
+    // Use reply chain if available, otherwise pull recent DB history for this user+channel
+    const history = replyChain.messages.length > 0
+        ? replyChain.messages
+        : getRecentHistory(guildId, channelId, userId).map(row => ({ role: row.role, content: row.content }));
 
     // Merge images: chain images + current message images (skip all in saving mode)
     const allImages = savingMode ? [] : [...replyChain.images, ...imageBlocks];
@@ -299,7 +326,16 @@ export async function chat(message, client) {
     }
 
     const personalityPrompt = getPersonality(guildId);
-    const systemPromptText = buildSystemPrompt({ userName, guildName, personalityPrompt, isAdmin: memberIsAdmin });
+
+    // Build channel memory context (last 5 conversations in this channel)
+    const channelMemory = getChannelMemory(guildId, channelId, 5);
+    let channelMemoryText = '';
+    if (channelMemory.length > 0) {
+        const lines = channelMemory.map(m => `${m.userName}: ${m.userMessage}\nYou: ${m.botResponse}`);
+        channelMemoryText = `\n\nRecent conversations in this channel:\n${lines.join('\n---\n')}\n\nUse this context if relevant, but don't reference it unprompted.`;
+    }
+
+    const systemPromptText = buildSystemPrompt({ userName, guildName, personalityPrompt, isAdmin: memberIsAdmin }) + channelMemoryText;
 
     const currentContent = buildUserContent(
         userContent || (allImages.length > 0 ? '(shared an image)' : ''),
@@ -330,8 +366,16 @@ export async function chat(message, client) {
         // Use higher max_tokens for admin requests to allow multi-step tool plans
         const effectiveMaxTokens = memberIsAdmin ? ADMIN_MAX_TOKENS : config.maxResponseTokens;
 
+        // Route to cheaper model for simple messages
+        const selectedModel = chooseModel({
+            text: userContent,
+            hasImages: allImages.length > 0,
+            isAdmin: memberIsAdmin,
+            hasTools: tools.length > 1, // more than just web_search
+        });
+
         const apiParams = {
-            model: 'claude-sonnet-4-6',
+            model: selectedModel,
             max_tokens: effectiveMaxTokens,
             system: [
                 {
@@ -364,6 +408,23 @@ export async function chat(message, client) {
 
             if (adminToolBlocks.length === 0) break;
 
+            // Check admin rate limit before executing any tools
+            const rateCheck = checkAdminRateLimit(guildId);
+            if (!rateCheck.allowed) {
+                const retrySeconds = Math.ceil(rateCheck.retryAfterMs / 1000);
+                // Return rate limit as tool results so Claude can inform the user
+                for (const toolUse of adminToolBlocks) {
+                    messages.push({ role: 'assistant', content: response.content });
+                    messages.push({ role: 'user', content: [{
+                        type: 'tool_result',
+                        tool_use_id: toolUse.id,
+                        content: `Rate limited — too many admin actions. Try again in ${retrySeconds} seconds.`,
+                        is_error: true,
+                    }] });
+                }
+                break;
+            }
+
             // Separate read-only tools (no confirmation needed) from write tools
             const readOnlyBlocks = adminToolBlocks.filter(b => isReadOnlyTool(b.name));
             const writeBlocks = adminToolBlocks.filter(b => !isReadOnlyTool(b.name));
@@ -378,6 +439,7 @@ export async function chat(message, client) {
                     tool_use_id: toolUse.id,
                     content: result.message,
                 });
+                recordAdminToolCall(guildId);
             }
 
             // Write tools need confirmation
@@ -394,6 +456,7 @@ export async function chat(message, client) {
                             tool_use_id: toolUse.id,
                             content: result.message,
                         });
+                        recordAdminToolCall(guildId);
 
                         // Record undo metadata
                         if (result.undo) {
@@ -440,7 +503,7 @@ export async function chat(message, client) {
             totalOutput += response.usage.output_tokens;
         }
 
-        recordUsage(guildId, userId, totalInput, totalOutput);
+        recordUsage(guildId, userId, totalInput, totalOutput, selectedModel);
 
         let responseText = extractResponseText(response);
 
@@ -464,10 +527,12 @@ export async function chat(message, client) {
             guild: guildId,
             channel: channelId,
             user: userId,
+            model: selectedModel,
             inputTokens: totalInput,
             outputTokens: totalOutput,
             hasImages: allImages.length > 0,
             replyChainLength: history.length,
+            channelMemorySize: channelMemory.length,
             toolRounds: rounds,
             isAdmin: memberIsAdmin,
         });
