@@ -10,13 +10,8 @@ import ready from './events/ready.js';
 import messageCreate from './events/messageCreate.js';
 import interactionCreate from './events/interactionCreate.js';
 
-import { seedDatabaseIfNeeded } from './utils/seedDb.js';
-
 // Set log level
 logger.setLevel(config.logLevel);
-
-// Seed database from backup if running on Railway with empty volume
-seedDatabaseIfNeeded();
 
 // Initialize database
 getDb();
