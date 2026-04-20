@@ -138,7 +138,7 @@ All configuration is via environment variables. See `.env.example` for the full 
 src/
   ai/
     chat.js            — Main chat logic, model routing, tool execution loop
-    adminTools.js      — 22 admin tools with sanitization, confirmation, undo
+    adminTools.js      — 23 admin tools with sanitization, confirmation, undo
     systemPrompt.js    — Dynamic system prompt builder
     personality.js     — Personality digest system
     client.js          — Anthropic SDK client
@@ -152,6 +152,7 @@ src/
   utils/
     rateLimiter.js     — Per-user and per-channel rate limiting
     adminRateLimiter.js — Per-guild admin tool rate limiting
+    permissions.js     — Discord permission checking helpers
     backup.js          — Daily DB backup with retention
     weeklyMetrics.js   — Weekly usage report
     errorNotifier.js   — Error alerts to Discord
