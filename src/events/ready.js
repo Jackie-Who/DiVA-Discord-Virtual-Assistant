@@ -9,7 +9,8 @@ export default function ready(client) {
             guilds: client.guilds.cache.size,
         });
 
-        client.user.setActivity('for @mentions', { type: ActivityType.Watching });
+        // Bio-style status: "Discord Virtual Assistant | @mention me"
+        client.user.setActivity('Discord Virtual Assistant | @mention me', { type: ActivityType.Custom });
 
         // Run cleanup on startup and every 12 hours
         cleanupOldMessages();

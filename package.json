@@ -1,7 +1,7 @@
 {
-  "name": "discord-bot",
+  "name": "diva",
   "version": "1.0.0",
-  "description": "Discord bot powered by Claude Sonnet 4.6 with evolving personality",
+  "description": "DiVA — Discord Virtual Assistant. A Claude-powered Discord bot with evolving personality, admin tools, and multi-model routing.",
   "type": "module",
   "main": "src/index.js",
   "scripts": {

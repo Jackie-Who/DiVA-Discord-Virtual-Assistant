@@ -1,6 +1,6 @@
 export default {
     apps: [{
-        name: 'discord-bot',
+        name: 'diva',
         script: 'src/index.js',
         instances: 1,
         autorestart: true,

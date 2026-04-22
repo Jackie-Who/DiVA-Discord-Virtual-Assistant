@@ -1,5 +1,5 @@
 @echo off
-title Discord Bot - Starting...
+title DiVA - Starting...
 
 cd /d "%~dp0"
 

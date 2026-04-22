@@ -1,6 +1,8 @@
-# Sonnet Discord Agent
+# DiVA — **Di**scord **V**irtual **A**ssistant
 
-A Discord bot powered by Claude AI with an evolving personality system, intelligent model routing, admin tools with confirmation/undo, per-channel memory, and strict token budget enforcement.
+A Claude-powered Discord bot with an evolving personality system, intelligent model routing, admin tools with confirmation/undo, per-channel memory, and strict token budget enforcement.
+
+> DiVA can appear under a different nickname on any server via Discord's built-in "Change Nickname" feature. The global bot identity is DiVA, but individual servers can rename it (e.g., "kurbot").
 
 ## Features
 
@@ -54,8 +56,8 @@ All write operations require confirmation via buttons before executing. After ex
 ## Setup
 
 ```bash
-git clone https://github.com/Jackie-Who/Sonnet-Discord-Agent.git
-cd Sonnet-Discord-Agent
+git clone https://github.com/Jackie-Who/DiVA.git
+cd DiVA
 npm install
 cp .env.example .env
 # Fill in .env with your tokens and keys
@@ -75,15 +77,15 @@ pm2 save
 ### With Docker / Railway
 
 ```bash
-docker build -t discord-bot .
-docker run --env-file .env -v /path/to/data:/app/data discord-bot
+docker build -t diva .
+docker run --env-file .env -v /path/to/data:/app/data diva
 ```
 
 For Railway: set `DATA_DIR=/app/data` and attach a persistent volume at `/app/data`.
 
-## Discord Bot Permissions
+## Discord Permissions
 
-The bot needs these permissions:
+DiVA needs these permissions:
 
 - Send Messages, Read Message History, Add Reactions
 - Manage Channels, Manage Roles, Manage Messages
