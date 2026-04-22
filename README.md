@@ -56,8 +56,8 @@ All write operations require confirmation via buttons before executing. After ex
 ## Setup
 
 ```bash
-git clone https://github.com/Jackie-Who/DiVA.git
-cd DiVA
+git clone https://github.com/Jackie-Who/DiVA-Discord-Virtual-Assistant.git
+cd DiVA-Discord-Virtual-Assistant
 npm install
 cp .env.example .env
 # Fill in .env with your tokens and keys
