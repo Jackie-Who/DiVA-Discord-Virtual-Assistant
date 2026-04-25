@@ -26,6 +26,7 @@ import {
     cleanupExpiredReminders,
 } from '../db/reminders.js';
 import { getUserSettings } from '../db/userSettings.js';
+import { parseSqliteUtc, toSqliteUtc } from './timezone.js';
 
 const SCHEDULE_HORIZON_HOURS = 24;
 const SETTIMEOUT_MAX_MS = 2_147_483_647; // ~24.8 days
@@ -93,7 +94,9 @@ function loadAndSchedule() {
  * Set a timer for one reminder. Caller has already verified it's not in the Map.
  */
 function scheduleTimer(reminder) {
-    const fireAt = new Date(reminder.fire_at_utc).getTime();
+    // CRITICAL: fire_at_utc is stored as "YYYY-MM-DD HH:MM:SS" without a Z marker.
+    // We must parse it as UTC explicitly — `new Date(str)` would treat it as local time.
+    const fireAt = parseSqliteUtc(reminder.fire_at_utc).getTime();
     const ms = Math.max(0, fireAt - Date.now());
 
     if (ms > SETTIMEOUT_MAX_MS) {
@@ -223,9 +226,9 @@ async function scheduleNextRecurringInstance(reminder) {
     }
 
     const intervalDays = reminder.recurrence === 'weekly' ? 7 : 1;
-    const lastFire = new Date(reminder.fire_at_utc);
+    const lastFire = parseSqliteUtc(reminder.fire_at_utc);
     const nextUtc = new Date(lastFire.getTime() + intervalDays * 24 * 60 * 60 * 1000);
-    const nextUtcIso = nextUtc.toISOString().replace('T', ' ').replace(/\.\d+Z$/, '');
+    const nextUtcIso = toSqliteUtc(nextUtc);
 
     const newId = insertNextRecurringInstance({
         parentId: reminder.parent_id || reminder.id,

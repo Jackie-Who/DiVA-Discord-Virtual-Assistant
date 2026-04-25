@@ -63,9 +63,36 @@ export function localToUtc(localStr, zone) {
 /**
  * Format a Date as a SQLite-friendly UTC string: "YYYY-MM-DD HH:MM:SS".
  * (SQLite's datetime() uses this format — matches stored fire_at_utc values.)
+ *
+ * IMPORTANT: this format does NOT include a timezone marker ("Z"). When you
+ * read these values back into JavaScript, use `parseSqliteUtc()` below, NOT
+ * `new Date(str)` — JS would parse the bare format as LOCAL time, not UTC.
  */
 export function toSqliteUtc(date) {
     return date.toISOString().replace('T', ' ').replace(/\.\d{3}Z$/, '');
+}
+
+/**
+ * Parse a SQLite-stored UTC datetime string back into a JS Date.
+ * Use this for any column that was written with `toSqliteUtc()` — fire_at_utc,
+ * fired_at, cancelled_at, etc.
+ *
+ * Accepts either "YYYY-MM-DD HH:MM:SS" or "YYYY-MM-DDTHH:MM:SS". Always treats
+ * the string as UTC, regardless of the host machine's local timezone.
+ */
+export function parseSqliteUtc(str) {
+    if (!str) return null;
+    if (str instanceof Date) return str;
+    const m = /^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2})(?::(\d{2}))?(?:\.\d+)?Z?$/.exec(str.trim());
+    if (!m) return new Date(str); // last-ditch fallback
+    return new Date(Date.UTC(
+        parseInt(m[1], 10),
+        parseInt(m[2], 10) - 1,
+        parseInt(m[3], 10),
+        parseInt(m[4], 10),
+        parseInt(m[5], 10),
+        m[6] ? parseInt(m[6], 10) : 0,
+    ));
 }
 
 /**

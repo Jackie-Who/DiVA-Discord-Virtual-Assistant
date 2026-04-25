@@ -10,7 +10,7 @@
 import { getActiveRemindersForUser, cancelReminder, getReminderById } from '../db/reminders.js';
 import { getUserSettings } from '../db/userSettings.js';
 import { cancelTimer } from '../utils/reminderScheduler.js';
-import { discordTimestamp } from '../utils/timezone.js';
+import { discordTimestamp, parseSqliteUtc } from '../utils/timezone.js';
 
 export default async function reminder(interaction) {
     const sub = interaction.options.getSubcommand();
@@ -93,6 +93,6 @@ function formatRow(r, _tz) {
             : 'every day';
         return `\`#${r.id}\` 🔁 ${day} at ${r.fire_time_local} — ${r.message.slice(0, 100)}`;
     }
-    const fireAt = new Date(r.fire_at_utc);
+    const fireAt = parseSqliteUtc(r.fire_at_utc);
     return `\`#${r.id}\` ⏰ ${discordTimestamp(fireAt, 'f')} (${discordTimestamp(fireAt, 'R')}) — ${r.message.slice(0, 100)}`;
 }

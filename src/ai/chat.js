@@ -6,7 +6,7 @@ import { getUserSettings } from '../db/userSettings.js';
 import { isGuildOutOfCredits, isGuildInSavingMode, getGuildSpendPercent, recordUsage } from '../db/tokenBudget.js';
 import { runPersonalityDigest } from './personality.js';
 import { ADMIN_TOOL_DEFINITIONS, executeAdminTool, isReadOnlyTool, formatToolForConfirmation, recordUndoableAction, getUndoableActions, clearUndoActions, executeUndo } from './adminTools.js';
-import { USER_TOOL_DEFINITIONS, executeUserTool, isUserTool, isReadOnlyUserTool, formatUserToolForConfirmation } from './userTools.js';
+import { USER_TOOL_DEFINITIONS, executeUserTool, isUserTool, isReadOnlyUserTool, formatUserToolForConfirmation, shouldSkipConfirmation } from './userTools.js';
 import config from '../config.js';
 import logger from '../utils/logger.js';
 import { PermissionsBitField, ActionRowBuilder, ButtonBuilder, ButtonStyle, ComponentType } from 'discord.js';
@@ -479,11 +479,16 @@ export async function chat(message, client) {
                 }
             }
 
-            // Separate read-only from write across both categories
+            // Separate read-only from write across both categories.
+            // User tools have a third bucket: "auto-execute" (e.g., set_timezone,
+            // short one-shot reminders <24h away) which run without a confirmation card.
             const adminReadOnly = adminBlocks.filter(b => isReadOnlyTool(b.name));
             const adminWrite = adminBlocks.filter(b => !isReadOnlyTool(b.name));
+
             const userReadOnly = userBlocks.filter(b => isReadOnlyUserTool(b.name));
-            const userWrite = userBlocks.filter(b => !isReadOnlyUserTool(b.name));
+            const userWriteAll = userBlocks.filter(b => !isReadOnlyUserTool(b.name));
+            const userAutoExec = userWriteAll.filter(b => shouldSkipConfirmation(b.name, b.input, userId));
+            const userWrite = userWriteAll.filter(b => !shouldSkipConfirmation(b.name, b.input, userId));
 
             const writeBlocks = [...adminWrite, ...userWrite];
             const toolResults = [];
@@ -505,6 +510,16 @@ export async function chat(message, client) {
                     tool_use_id: toolUse.id,
                     content: result.message,
                 });
+            }
+            // Auto-execute user-write tools that don't need confirmation (set_timezone, short reminders)
+            for (const toolUse of userAutoExec) {
+                const result = await executeUserTool(toolUse.name, toolUse.input, message, userId);
+                toolResults.push({
+                    type: 'tool_result',
+                    tool_use_id: toolUse.id,
+                    content: result.message,
+                });
+                writesExecutedThisTurn = true; // counts as a write — prevents double-firing
             }
 
             // Write tools need confirmation (single combined card if mixed admin + user).

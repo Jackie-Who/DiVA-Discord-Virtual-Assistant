@@ -13,7 +13,7 @@
  */
 
 import logger from '../utils/logger.js';
-import { localToUtc, formatLocal, toSqliteUtc, isValidIANAZone, discordTimestamp } from '../utils/timezone.js';
+import { localToUtc, formatLocal, toSqliteUtc, parseSqliteUtc, isValidIANAZone, discordTimestamp } from '../utils/timezone.js';
 import { getUserSettings } from '../db/userSettings.js';
 import {
     createOneShot,
@@ -26,10 +26,27 @@ import {
     getActiveRemindersForUser,
 } from '../db/reminders.js';
 import { scheduleNewReminder, cancelTimer, rescheduleTimer } from '../utils/reminderScheduler.js';
+import { setTimezone } from '../db/userSettings.js';
+
+const SHORT_REMINDER_THRESHOLD_MS = 24 * 60 * 60 * 1000; // 24h — short reminders auto-execute, no confirmation
 
 // ── Tool schemas (Anthropic tool_use format) ──
 
 export const USER_TOOL_DEFINITIONS = [
+    {
+        name: 'set_timezone',
+        description: 'Set the current user\'s timezone. Use this when the user describes their timezone in natural language (e.g., "set my timezone to vancouver time", "I\'m in EST", "Tokyo time"). YOU are responsible for resolving the user\'s phrase to a valid IANA timezone identifier (e.g., "America/Vancouver", "America/New_York", "Asia/Tokyo"). Use the closest major-city IANA zone. NEVER pass the user\'s raw phrase — always pass a canonical IANA name.',
+        input_schema: {
+            type: 'object',
+            properties: {
+                iana_zone: {
+                    type: 'string',
+                    description: 'A valid IANA timezone identifier you derived from the user\'s description. Examples: "America/Los_Angeles", "America/Vancouver", "America/New_York", "America/Chicago", "America/Denver", "America/Toronto", "Europe/London", "Europe/Paris", "Europe/Berlin", "Asia/Tokyo", "Asia/Shanghai", "Australia/Sydney". For ambiguous phrases like "PST" or "EST", prefer the matching America/* zone (e.g., "PST" → "America/Los_Angeles" since it handles DST too).',
+                },
+            },
+            required: ['iana_zone'],
+        },
+    },
     {
         name: 'set_reminder',
         description: 'Schedule a one-shot reminder for the current user. The user MUST have set their timezone via /timezone first. Posts in the channel where the reminder was set, at the requested local time.',
@@ -114,9 +131,37 @@ export const USER_TOOL_DEFINITIONS = [
 
 const USER_TOOLS = new Set(USER_TOOL_DEFINITIONS.map(t => t.name));
 const USER_READ_ONLY_TOOLS = new Set(['list_my_reminders']);
+// Tools that bypass the confirmation card and execute immediately. set_timezone
+// is harmless (just updates the user's preference); short one-shot reminders
+// (less than 24h away) skip confirmation per UX direction.
+const USER_AUTO_EXECUTE_TOOLS = new Set(['set_timezone']);
 
 export function isUserTool(name) { return USER_TOOLS.has(name); }
 export function isReadOnlyUserTool(name) { return USER_READ_ONLY_TOOLS.has(name); }
+
+/**
+ * Returns true when this user-tool call should bypass the confirmation card
+ * and execute immediately. Currently:
+ *   - set_timezone: always
+ *   - set_reminder: when fire_at_local resolves to less than 24h away
+ *
+ * Long reminders (>=24h), recurring reminders, cancel, and reschedule still
+ * require confirmation.
+ */
+export function shouldSkipConfirmation(toolName, input, userId) {
+    if (USER_AUTO_EXECUTE_TOOLS.has(toolName)) return true;
+    if (toolName !== 'set_reminder') return false;
+
+    const settings = getUserSettings(userId);
+    if (!settings.timezone) return false;
+    try {
+        const utc = localToUtc(input.fire_at_local, settings.timezone);
+        const ms = utc.getTime() - Date.now();
+        return ms > 0 && ms < SHORT_REMINDER_THRESHOLD_MS;
+    } catch {
+        return false; // can't compute → fall through to normal confirmation flow (which will surface the parse error)
+    }
+}
 
 const WEEKDAY_NAMES = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
 
@@ -126,6 +171,9 @@ export function formatUserToolForConfirmation(toolName, input, userId) {
     const tz = getUserSettings(userId).timezone || 'UTC';
 
     switch (toolName) {
+        case 'set_timezone': {
+            return `🕒 **Set timezone:** \`${input.iana_zone}\``;
+        }
         case 'set_reminder': {
             try {
                 const utc = localToUtc(input.fire_at_local, tz);
@@ -147,7 +195,7 @@ export function formatUserToolForConfirmation(toolName, input, userId) {
                 if (r && r.user_id === userId) {
                     const when = r.recurrence
                         ? ''
-                        : ` (${discordTimestamp(new Date(r.fire_at_utc), 'R')})`;
+                        : ` (${discordTimestamp(parseSqliteUtc(r.fire_at_utc), 'R')})`;
                     return `🗑️ **Cancel reminder #${input.id}:** _"${truncate(r.message, 80)}"_${r.recurrence ? ` (${r.recurrence})` : when}`;
                 }
                 return `🗑️ Cancel reminder #${input.id}`;
@@ -194,6 +242,7 @@ export async function executeUserTool(toolName, input, message, userId) {
 
     try {
         switch (toolName) {
+            case 'set_timezone':                return doSetTimezone(input, userId);
             case 'set_reminder':                return await doSetReminder(input, message, userId, settings);
             case 'set_recurring_reminder':      return await doSetRecurring(input, message, userId, settings);
             case 'list_my_reminders':           return doListMine(userId, settings);
@@ -210,6 +259,27 @@ export async function executeUserTool(toolName, input, message, userId) {
 
 // ── Tool bodies ──
 
+function doSetTimezone(input, userId) {
+    const zone = (input.iana_zone || '').trim();
+    if (!zone) {
+        return { success: false, message: 'Timezone cannot be empty.' };
+    }
+    if (!isValidIANAZone(zone)) {
+        return {
+            success: false,
+            message: `"${zone}" is not a valid IANA timezone. Try a city/region name like "America/Los_Angeles", "America/Vancouver", "Europe/London", or "Asia/Tokyo".`,
+        };
+    }
+    setTimezone(userId, zone);
+    const now = new Intl.DateTimeFormat('en-US', {
+        timeZone: zone, weekday: 'short', hour: 'numeric', minute: '2-digit', hour12: true,
+    }).format(new Date());
+    return {
+        success: true,
+        message: `Timezone set to \`${zone}\`. It's currently **${now}** in your timezone.`,
+    };
+}
+
 function doListMine(userId, _settings) {
     const rows = getActiveRemindersForUser(userId);
     if (rows.length === 0) {
@@ -223,7 +293,7 @@ function doListMine(userId, _settings) {
                 : 'every day';
             return `#${r.id} — 🔁 ${day} at ${r.fire_time_local} — ${truncate(r.message, 80)}`;
         }
-        const utc = new Date(r.fire_at_utc);
+        const utc = parseSqliteUtc(r.fire_at_utc);
         return `#${r.id} — ⏰ ${discordTimestamp(utc, 'f')} (${discordTimestamp(utc, 'R')}) — ${truncate(r.message, 80)}`;
     }).filter(Boolean);
     return { success: true, message: `Your active reminders:\n${lines.join('\n')}` };
