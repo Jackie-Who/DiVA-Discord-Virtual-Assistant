@@ -2,7 +2,7 @@ import anthropic from './client.js';
 import { buildSystemPrompt } from './systemPrompt.js';
 import { saveMessage, getRecentHistory, getChannelMemory } from '../db/history.js';
 import { getPersonality, incrementInteractionCount, shouldRunDigest } from '../db/personality.js';
-import { isBudgetExhausted, isInSavingMode, getBudgetPercent, recordUsage } from '../db/tokenBudget.js';
+import { isGuildOutOfCredits, isGuildInSavingMode, getGuildSpendPercent, recordUsage } from '../db/tokenBudget.js';
 import { runPersonalityDigest } from './personality.js';
 import { ADMIN_TOOL_DEFINITIONS, executeAdminTool, isReadOnlyTool, formatToolForConfirmation, recordUndoableAction, getUndoableActions, clearUndoActions, executeUndo } from './adminTools.js';
 import config from '../config.js';
@@ -20,7 +20,6 @@ const MODEL_HAIKU = 'claude-haiku-4-5-20251001';
 const COMPLEX_INDICATORS = /\b(explain|analyze|compare|how does|why does|write|code|debug|review|create|help me|build|implement|summarize|describe|what happened|tell me about)\b/i;
 const SIMPLE_MAX_LENGTH = 200; // Messages under this length with no complex indicators use Haiku
 
-const BUDGET_EXHAUSTED_MESSAGE = "I've used up my thinking budget for this month. I'll be back on the 1st! \u{1F4A4}";
 const SAVING_MODE_WARNING = "\n\n\u26A0\uFE0F *Budget is above 85% for the month — web search and image analysis are disabled to conserve tokens.*";
 const MAX_TOOL_ROUNDS = 3;
 
@@ -290,20 +289,19 @@ export async function chat(message, client) {
     const guildName = message.guild.name;
     const memberIsAdmin = isAdmin(message.member);
 
-    if (isBudgetExhausted()) {
-        return BUDGET_EXHAUSTED_MESSAGE;
-    }
+    // Out-of-credits is handled in messageCreate.js (with the 24h notice cooldown).
+    // chat() is only called when the guild still has credits.
 
     let userContent = stripMentions(message.content);
 
-    // Inject budget percentage if the user asks about usage/budget/tokens
+    // Inject spend percentage if the user asks about usage/budget/tokens
     const budgetKeywords = /\b(usage|budget|token|limit|spending|cost|how much|remaining|left)\b/i;
     if (budgetKeywords.test(userContent)) {
-        const pct = getBudgetPercent().toFixed(1);
-        userContent += `\n\n[System: Current monthly budget usage is ${pct}% of total capacity.]`;
+        const pct = getGuildSpendPercent(guildId).toFixed(1);
+        userContent += `\n\n[System: This server has used ${pct}% of its credits.]`;
     }
 
-    const savingMode = isInSavingMode();
+    const savingMode = isGuildInSavingMode(guildId);
     const imageBlocks = savingMode ? [] : getImageAttachments(message);
 
     // Build reply chain context (includes images from chain)

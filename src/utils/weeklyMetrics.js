@@ -6,7 +6,7 @@
  */
 
 import { getDb } from '../db/init.js';
-import { getCurrentMonthUsage, getBudgetPercent } from '../db/tokenBudget.js';
+// (token budget imports removed in v1.2 — credit data is queried directly below)
 import config from '../config.js';
 import logger from './logger.js';
 
@@ -136,18 +136,29 @@ function gatherMetrics() {
         WHERE created_at > datetime('now', '-7 days') AND role = 'user'
     `).get();
 
-    // Month totals
-    const monthUsage = getCurrentMonthUsage();
-    const budgetPct = getBudgetPercent();
+    // Per-guild credit balances (v1.2+: replaces the old global monthly budget summary)
+    const guildCredits = db.prepare(`
+        SELECT guild_id, lifetime_credits_usd, total_spent_usd, owner_managed
+        FROM guild_credits
+        ORDER BY total_spent_usd DESC
+    `).all();
 
-    return { weekStats, topUsers, topGuilds, dailyBreakdown, conversations, monthUsage, budgetPct };
+    const totalLifetime = guildCredits.reduce((sum, g) => sum + g.lifetime_credits_usd, 0);
+    const totalSpent = guildCredits.reduce((sum, g) => sum + g.total_spent_usd, 0);
+    const totalRemaining = Math.max(0, totalLifetime - totalSpent);
+
+    return {
+        weekStats, topUsers, topGuilds, dailyBreakdown, conversations,
+        guildCredits, totalLifetime, totalSpent, totalRemaining,
+    };
 }
 
 /**
  * Format metrics into a Discord message.
  */
 function formatMetricsMessage(metrics) {
-    const { weekStats, topUsers, topGuilds, dailyBreakdown, conversations, monthUsage, budgetPct } = metrics;
+    const { weekStats, topUsers, topGuilds, dailyBreakdown, conversations,
+            guildCredits, totalLifetime, totalSpent, totalRemaining } = metrics;
 
     const avgCostPerCall = weekStats.total_calls > 0
         ? (weekStats.total_cost / weekStats.total_calls).toFixed(4)
@@ -200,16 +211,31 @@ function formatMetricsMessage(metrics) {
         msg += `\n`;
     }
 
-    // Monthly budget status
-    msg += `## Monthly Budget Status\n`;
-    msg += `- **Used:** $${monthUsage.costUsd.toFixed(4)} / $${monthUsage.budgetLimitUsd.toFixed(2)}\n`;
-    msg += `- **Remaining:** $${monthUsage.remainingUsd.toFixed(4)}\n`;
-    msg += `- **Budget Used:** ${budgetPct.toFixed(1)}%\n`;
-    const bar = '█'.repeat(Math.round(budgetPct / 5)) + '░'.repeat(20 - Math.round(budgetPct / 5));
-    msg += `- **Progress:** \`[${bar}]\`\n`;
+    // Per-guild credit balances (v1.2+ replaces the old global monthly summary)
+    msg += `## Credit Balances (All Guilds)\n`;
+    msg += `- **Total Lifetime Granted:** $${totalLifetime.toFixed(4)}\n`;
+    msg += `- **Total Spent:** $${totalSpent.toFixed(4)}\n`;
+    msg += `- **Total Remaining:** $${totalRemaining.toFixed(4)}\n\n`;
 
-    if (budgetPct >= 85) {
-        msg += `- ⚠️ **Saving mode is ACTIVE** (web search & vision disabled)\n`;
+    if (guildCredits.length > 0) {
+        msg += `### Per-Guild Detail\n`;
+        msg += `\`\`\`\n`;
+        msg += `Guild ID             │ Lifetime  │ Spent     │ Remaining │ %    │ Mgd\n`;
+        msg += `─────────────────────┼───────────┼───────────┼───────────┼──────┼─────\n`;
+        for (const g of guildCredits) {
+            const id = g.guild_id.padEnd(20).slice(0, 20);
+            const lt = `$${g.lifetime_credits_usd.toFixed(2)}`.padStart(9);
+            const sp = `$${g.total_spent_usd.toFixed(4)}`.padStart(9);
+            const rem = Math.max(0, g.lifetime_credits_usd - g.total_spent_usd);
+            const remStr = `$${rem.toFixed(4)}`.padStart(9);
+            const pct = g.lifetime_credits_usd > 0
+                ? `${((g.total_spent_usd / g.lifetime_credits_usd) * 100).toFixed(0)}%`
+                : '—';
+            const pctStr = pct.padStart(4);
+            const mgd = g.owner_managed ? 'OWN' : '—';
+            msg += `${id} │${lt} │${sp} │${remStr} │${pctStr}  │ ${mgd}\n`;
+        }
+        msg += `\`\`\`\n`;
     }
 
     return msg;

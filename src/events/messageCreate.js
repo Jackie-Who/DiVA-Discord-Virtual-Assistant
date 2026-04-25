@@ -1,6 +1,6 @@
 import { chat } from '../ai/chat.js';
 import { isRateLimited } from '../utils/rateLimiter.js';
-import { isBudgetExhausted } from '../db/tokenBudget.js';
+import { isGuildOutOfCredits, tryClaimOofNotice } from '../db/credits.js';
 import logger from '../utils/logger.js';
 import { notifyError } from '../utils/errorNotifier.js';
 
@@ -38,12 +38,22 @@ export default function messageCreate(client) {
             return;
         }
 
-        // Budget check
-        if (isBudgetExhausted()) {
-            try {
-                await message.reply("I've used up my thinking budget for this month. I'll be back on the 1st! \u{1F4A4}");
-            } catch (error) {
-                logger.error('Failed to send budget message', { error: error.message });
+        // Out-of-credits check (per-server lifetime credits, owner-managed guilds bypass)
+        if (isGuildOutOfCredits(message.guild.id)) {
+            // Post the OOF notice at most once per 24h per guild — don't spam.
+            const shouldNotify = tryClaimOofNotice(message.guild.id);
+            if (shouldNotify) {
+                try {
+                    await message.reply(
+                        "💤 This server is out of credits. An admin can top up with `/credits` (or contact the bot owner). " +
+                        "I'll be back as soon as credits are added!"
+                    );
+                } catch (error) {
+                    logger.error('Failed to send out-of-credits message', { error: error.message });
+                }
+            } else {
+                // Silent acknowledge so the user knows we saw it but won't reply.
+                try { await message.react('\u{1F4A4}'); } catch { /* missing perms */ }
             }
             return;
         }

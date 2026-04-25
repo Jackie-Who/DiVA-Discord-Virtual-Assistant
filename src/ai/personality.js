@@ -1,7 +1,7 @@
 import anthropic from './client.js';
 import { getPersonality, updatePersonality } from '../db/personality.js';
 import { getRecentBotInteractions } from '../db/history.js';
-import { isBudgetExhausted, recordUsage } from '../db/tokenBudget.js';
+import { isGuildOutOfCredits, recordUsage } from '../db/tokenBudget.js';
 import logger from '../utils/logger.js';
 
 const DIGEST_SYSTEM_PROMPT = `You are a personality calibration system for a Discord bot. You will receive the bot's current personality description and a batch of recent conversations the bot had with users.
@@ -23,8 +23,8 @@ Rules:
 - Never include any user's personal information`;
 
 export async function runPersonalityDigest(guildId) {
-    if (isBudgetExhausted()) {
-        logger.warn('Skipping personality digest — budget exhausted', { guildId });
+    if (isGuildOutOfCredits(guildId)) {
+        logger.warn('Skipping personality digest — guild out of credits', { guildId });
         return;
     }
 
