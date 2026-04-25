@@ -13,7 +13,7 @@
  */
 
 import logger from '../utils/logger.js';
-import { localToUtc, formatLocal, toSqliteUtc, isValidIANAZone } from '../utils/timezone.js';
+import { localToUtc, formatLocal, toSqliteUtc, isValidIANAZone, discordTimestamp } from '../utils/timezone.js';
 import { getUserSettings } from '../db/userSettings.js';
 import {
     createOneShot,
@@ -129,8 +129,8 @@ export function formatUserToolForConfirmation(toolName, input, userId) {
         case 'set_reminder': {
             try {
                 const utc = localToUtc(input.fire_at_local, tz);
-                const local = formatLocal(utc, tz);
-                return `⏰ **Reminder:** _"${truncate(input.message, 80)}"_\n→ ${local}`;
+                // Discord renders these in the viewer's own locale + timezone
+                return `⏰ **Reminder:** _"${truncate(input.message, 80)}"_\n→ ${discordTimestamp(utc, 'F')} (${discordTimestamp(utc, 'R')})`;
             } catch {
                 return `⏰ Reminder: _"${truncate(input.message, 80)}"_ at ${input.fire_at_local} (${tz})`;
             }
@@ -145,7 +145,10 @@ export function formatUserToolForConfirmation(toolName, input, userId) {
             if (input.id) {
                 const r = getReminderById(input.id);
                 if (r && r.user_id === userId) {
-                    return `🗑️ **Cancel reminder #${input.id}:** _"${truncate(r.message, 80)}"_${r.recurrence ? ` (${r.recurrence})` : ''}`;
+                    const when = r.recurrence
+                        ? ''
+                        : ` (${discordTimestamp(new Date(r.fire_at_utc), 'R')})`;
+                    return `🗑️ **Cancel reminder #${input.id}:** _"${truncate(r.message, 80)}"_${r.recurrence ? ` (${r.recurrence})` : when}`;
                 }
                 return `🗑️ Cancel reminder #${input.id}`;
             }
@@ -153,11 +156,17 @@ export function formatUserToolForConfirmation(toolName, input, userId) {
         }
         case 'reschedule_reminder': {
             const id = input.id ? `#${input.id}` : `matching "${truncate(input.query || '', 60)}"`;
-            const newWhen = input.new_fire_at_local
-                ? `→ ${input.new_fire_at_local} (${tz})`
-                : input.new_fire_time_local
-                    ? `→ every ${input.new_weekday !== undefined ? WEEKDAY_NAMES[input.new_weekday] : 'day'} at ${input.new_fire_time_local}`
-                    : '';
+            let newWhen = '';
+            if (input.new_fire_at_local) {
+                try {
+                    const newUtc = localToUtc(input.new_fire_at_local, tz);
+                    newWhen = `→ ${discordTimestamp(newUtc, 'F')} (${discordTimestamp(newUtc, 'R')})`;
+                } catch {
+                    newWhen = `→ ${input.new_fire_at_local} (${tz})`;
+                }
+            } else if (input.new_fire_time_local) {
+                newWhen = `→ every ${input.new_weekday !== undefined ? WEEKDAY_NAMES[input.new_weekday] : 'day'} at ${input.new_fire_time_local}`;
+            }
             return `✏️ **Reschedule reminder ${id}**\n${newWhen}`;
         }
         default:
@@ -201,12 +210,11 @@ export async function executeUserTool(toolName, input, message, userId) {
 
 // ── Tool bodies ──
 
-function doListMine(userId, settings) {
+function doListMine(userId, _settings) {
     const rows = getActiveRemindersForUser(userId);
     if (rows.length === 0) {
         return { success: true, message: 'You have no active reminders.' };
     }
-    const tz = settings.timezone || 'UTC';
     const lines = rows.map(r => {
         if (r.recurrence && r.parent_id !== r.id) return null; // skip child instances of recurring rules
         if (r.recurrence) {
@@ -216,7 +224,7 @@ function doListMine(userId, settings) {
             return `#${r.id} — 🔁 ${day} at ${r.fire_time_local} — ${truncate(r.message, 80)}`;
         }
         const utc = new Date(r.fire_at_utc);
-        return `#${r.id} — ⏰ ${formatLocal(utc, tz)} — ${truncate(r.message, 80)}`;
+        return `#${r.id} — ⏰ ${discordTimestamp(utc, 'f')} (${discordTimestamp(utc, 'R')}) — ${truncate(r.message, 80)}`;
     }).filter(Boolean);
     return { success: true, message: `Your active reminders:\n${lines.join('\n')}` };
 }
@@ -252,7 +260,7 @@ async function doSetReminder(input, message, userId, settings) {
 
     return {
         success: true,
-        message: `Reminder #${id} set for ${formatLocal(utc, settings.timezone)}. I'll ping in this channel.`,
+        message: `Reminder #${id} set for ${discordTimestamp(utc, 'F')} (${discordTimestamp(utc, 'R')}). I'll ping in this channel.`,
     };
 }
 
@@ -305,7 +313,7 @@ async function doSetRecurring(input, message, userId, settings) {
         : `every day at ${input.fire_time_local}`;
     return {
         success: true,
-        message: `Recurring reminder #${id} set: ${when} (${settings.timezone}). First fire: ${formatLocal(firstUtc, settings.timezone)}. Delivery: ${settings.deliveryMode === 'dm' ? 'DM' : 'channel'}.`,
+        message: `Recurring reminder #${id} set: ${when} (${settings.timezone}). First fire: ${discordTimestamp(firstUtc, 'F')} (${discordTimestamp(firstUtc, 'R')}). Delivery: ${settings.deliveryMode === 'dm' ? 'DM' : 'channel'}.`,
     };
 }
 
@@ -358,7 +366,7 @@ function doReschedule(input, userId, settings) {
             : `every day at ${input.new_fire_time_local}`;
         return {
             success: true,
-            message: `Rescheduled #${row.id} → ${when} (${settings.timezone}). Next fire: ${formatLocal(newUtc, settings.timezone)}.`,
+            message: `Rescheduled #${row.id} → ${when} (${settings.timezone}). Next fire: ${discordTimestamp(newUtc, 'F')} (${discordTimestamp(newUtc, 'R')}).`,
         };
     } else {
         // One-shot: must provide new_fire_at_local
@@ -378,7 +386,7 @@ function doReschedule(input, userId, settings) {
         rescheduleTimer(row.id);
         return {
             success: true,
-            message: `Rescheduled #${row.id} → ${formatLocal(newUtc, settings.timezone)}.`,
+            message: `Rescheduled #${row.id} → ${discordTimestamp(newUtc, 'F')} (${discordTimestamp(newUtc, 'R')}).`,
         };
     }
 }

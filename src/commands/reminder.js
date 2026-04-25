@@ -10,6 +10,7 @@
 import { getActiveRemindersForUser, cancelReminder, getReminderById } from '../db/reminders.js';
 import { getUserSettings } from '../db/userSettings.js';
 import { cancelTimer } from '../utils/reminderScheduler.js';
+import { discordTimestamp } from '../utils/timezone.js';
 
 export default async function reminder(interaction) {
     const sub = interaction.options.getSubcommand();
@@ -33,12 +34,12 @@ export default async function reminder(interaction) {
         let body = '';
         if (oneShots.length > 0) {
             body += '**One-shot:**\n';
-            body += oneShots.map(r => formatRow(r, tz)).join('\n') + '\n';
+            body += oneShots.map(r => formatRow(r, tz)).filter(Boolean).join('\n') + '\n';
         }
         if (recurring.length > 0) {
             if (body) body += '\n';
             body += '**Recurring:**\n';
-            body += recurring.map(r => formatRow(r, tz)).join('\n');
+            body += recurring.map(r => formatRow(r, tz)).filter(Boolean).join('\n');
         }
         body += '\n\n_Cancel one with `/reminder delete id:<number>`._';
 
@@ -84,21 +85,14 @@ export default async function reminder(interaction) {
     }
 }
 
-function formatRow(r, tz) {
+function formatRow(r, _tz) {
+    if (r.recurrence && r.parent_id !== r.id) return null; // skip child instances of recurring rules
+    if (r.recurrence) {
+        const day = r.recurrence === 'weekly' && r.weekday !== null
+            ? `every ${['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'][r.weekday]}`
+            : 'every day';
+        return `\`#${r.id}\` 🔁 ${day} at ${r.fire_time_local} — ${r.message.slice(0, 100)}`;
+    }
     const fireAt = new Date(r.fire_at_utc);
-    const local = new Intl.DateTimeFormat('en-US', {
-        timeZone: tz,
-        weekday: 'short',
-        month: 'short',
-        day: 'numeric',
-        hour: 'numeric',
-        minute: '2-digit',
-        hour12: true,
-    }).format(fireAt);
-
-    const tag = r.recurrence
-        ? ` _(${r.recurrence})_`
-        : '';
-
-    return `\`#${r.id}\` ${local}${tag} — ${r.message.slice(0, 100)}`;
+    return `\`#${r.id}\` ⏰ ${discordTimestamp(fireAt, 'f')} (${discordTimestamp(fireAt, 'R')}) — ${r.message.slice(0, 100)}`;
 }

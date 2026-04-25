@@ -71,6 +71,10 @@ export function toSqliteUtc(date) {
 /**
  * Format a UTC Date as a human-readable string in the given zone.
  * e.g. "Sun, Apr 26, 9:00 AM PDT"
+ *
+ * Use this only for log lines, owner-facing /budget output, etc. For anything
+ * shown to end users in Discord, prefer `discordTimestamp()` below — Discord
+ * renders that natively in the viewer's locale and zone.
  */
 export function formatLocal(date, zone, opts = {}) {
     return new Intl.DateTimeFormat('en-US', {
@@ -84,6 +88,28 @@ export function formatLocal(date, zone, opts = {}) {
         timeZoneName: 'short',
         ...opts,
     }).format(date);
+}
+
+/**
+ * Discord's auto-localized timestamp markdown. Discord renders <t:UNIX:F>
+ * in each viewer's own locale and timezone — no need for us to compute it.
+ *
+ * Formats:
+ *   t  → "9:00 AM"             (short time)
+ *   T  → "9:00:00 AM"          (long time)
+ *   d  → "04/26/2026"          (short date)
+ *   D  → "April 26, 2026"      (long date)
+ *   f  → "April 26, 2026 9:00 AM"          (short date+time, default)
+ *   F  → "Sunday, April 26, 2026 9:00 AM"  (long date+time, weekday)
+ *   R  → "in 2 hours" / "5 minutes ago"     (relative)
+ *
+ * @param {Date|number|string} date  Date object, ms timestamp, or ISO string
+ * @param {string} format  one of t T d D f F R (default: F)
+ */
+export function discordTimestamp(date, format = 'F') {
+    const d = date instanceof Date ? date : new Date(date);
+    const unix = Math.floor(d.getTime() / 1000);
+    return `<t:${unix}:${format}>`;
 }
 
 /**

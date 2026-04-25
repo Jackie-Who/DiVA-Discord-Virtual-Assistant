@@ -41,7 +41,14 @@ Important rules for reminders:
 - The user must have run /timezone <zone> first. If their timezone is not set, DON'T call set_reminder — instead tell them to run /timezone first.
 - For RECURRING only, the user must also have run /secretary on first to configure delivery preferences. If they haven't, tell them to run /secretary on before setting a recurring reminder.
 - ALWAYS pass times in the user's LOCAL timezone (Claude computes from "current local time" given below). Format: fire_at_local = "YYYY-MM-DD HH:MM" (24h), fire_time_local = "HH:MM".
-- Confirmation: every write action (set/cancel/reschedule) shows a ✅/❌ button to the user before executing. They control what happens.`;
+- Confirmation: every write action (set/cancel/reschedule) shows a ✅/❌ button to the user before executing. They control what happens.
+
+CRITICAL — TOOL CALL DISCIPLINE:
+- ONE tool call per user request. After a reminder tool returns success, your job is DONE — respond with a brief text confirmation. Do NOT call set_reminder again to "verify" or "double-check".
+- If a tool returns an ERROR (e.g., "you need to set your timezone" or "/secretary on first"), do NOT call any other reminder tool to work around it. Just relay the error message to the user as text.
+- If a tool returns "Action cancelled by user", do NOT retry the same tool with the same intent. The user said no — accept it and respond with text.
+- Never call set_reminder with a message text that wasn't in the user's CURRENT request. If you're unsure what to remind them about, ASK in text — don't guess from prior messages or channel history.
+- The bot's success message will display the time using Discord auto-timestamps (<t:UNIX:F>). You don't need to repeat the time in your text response — just acknowledge.`;
 
     // Add the current time context so Claude can compute "tomorrow at 9am"
     if (userTimezone) {

@@ -419,6 +419,9 @@ export async function chat(message, client) {
         // Tool use loop — handle admin tool calls with confirmation
         let rounds = 0;
         const undoButtonPromises = []; // fire-and-forget undo listeners
+        // Per-turn safeguard: once a write tool fires (or cancels), reject further
+        // write tools in the same conversation so Claude can't accidentally double-fire.
+        let writesExecutedThisTurn = false;
 
         while (response.stop_reason === 'tool_use' && rounds < MAX_TOOL_ROUNDS) {
             rounds++;
@@ -426,6 +429,16 @@ export async function chat(message, client) {
             const toolUseBlocks = response.content.filter(b => b.type === 'tool_use');
             // Strip web_search (server-side, no executor needed) — keep everything else for our routing
             const customBlocks = toolUseBlocks.filter(b => b.name !== 'web_search');
+
+            // Per-round debug — tells us exactly what Claude tried to do each round
+            if (customBlocks.length > 0) {
+                logger.debug('Tool round', {
+                    round: rounds,
+                    user: userId,
+                    blocks: customBlocks.map(b => ({ name: b.name, input_preview: JSON.stringify(b.input).slice(0, 200) })),
+                    writesExecutedThisTurn,
+                });
+            }
 
             if (customBlocks.length === 0) break;
 
@@ -494,9 +507,25 @@ export async function chat(message, client) {
                 });
             }
 
-            // Write tools need confirmation (single combined card if mixed admin + user)
-            if (writeBlocks.length > 0) {
+            // Write tools need confirmation (single combined card if mixed admin + user).
+            // Safeguard: if a write was already executed this turn, refuse new ones to
+            // prevent Claude from accidentally double-firing reminders/admin actions.
+            if (writeBlocks.length > 0 && writesExecutedThisTurn) {
+                logger.warn('Skipping duplicate write tools this turn', {
+                    user: userId,
+                    blocks: writeBlocks.map(b => b.name),
+                });
+                for (const toolUse of writeBlocks) {
+                    toolResults.push({
+                        type: 'tool_result',
+                        tool_use_id: toolUse.id,
+                        content: 'A write action was already completed this turn. Respond to the user with text instead — do not call this tool again.',
+                        is_error: true,
+                    });
+                }
+            } else if (writeBlocks.length > 0) {
                 const { confirmed, confirmMsgId, confirmMsg: cMsg, description } = await requestToolConfirmation(message, writeBlocks);
+                writesExecutedThisTurn = true; // counts even on cancel — don't re-prompt
 
                 if (confirmed) {
                     let hasUndoableActions = false;
@@ -537,11 +566,13 @@ export async function chat(message, client) {
                         );
                     }
                 } else {
+                    // User cancelled or timed out. Push tool_results so Claude can wrap up
+                    // with text, but the writesExecutedThisTurn flag now prevents retries.
                     for (const toolUse of writeBlocks) {
                         toolResults.push({
                             type: 'tool_result',
                             tool_use_id: toolUse.id,
-                            content: 'Action cancelled by user.',
+                            content: 'The user did not confirm this action. Acknowledge briefly in text — do NOT call this tool again with similar input.',
                         });
                     }
                 }
