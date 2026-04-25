@@ -163,7 +163,10 @@ async function fireReminder(reminderId) {
         return;
     }
 
-    const text = formatReminderMessage(reminder);
+    const body = formatReminderMessage(reminder);
+    // Ping the user when posting in a channel; in a DM the user IS the recipient
+    // and Discord doesn't render @mentions in DMs anyway.
+    const text = target.kind === 'channel' ? `<@${reminder.user_id}> ${body}` : body;
 
     try {
         await target.sendable.send(text);
@@ -175,12 +178,12 @@ async function fireReminder(reminderId) {
             target: target.kind,
         });
     } catch (err) {
-        // If DM failed, fall back to channel post
+        // If DM failed, fall back to channel post (with the ping)
         if (target.kind === 'dm') {
             const fallback = await resolveChannelTarget(reminder.channel_id);
             if (fallback) {
                 try {
-                    await fallback.sendable.send(`<@${reminder.user_id}> ${text}`);
+                    await fallback.sendable.send(`<@${reminder.user_id}> ${body}`);
                     markFired(reminderId);
                     logger.info('Reminder fired via channel fallback (DM closed)', { reminderId });
                 } catch (e2) {

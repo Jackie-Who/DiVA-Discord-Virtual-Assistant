@@ -191,12 +191,14 @@ export function formatUserToolForConfirmation(toolName, input, userId) {
         }
         case 'cancel_reminder': {
             if (input.id) {
-                const r = getReminderById(input.id);
-                if (r && r.user_id === userId) {
+                // Resolve position → DB row to preview the actual reminder's content
+                const active = getActiveRemindersForUser(userId);
+                const r = active[input.id - 1];
+                if (r) {
                     const when = r.recurrence
-                        ? ''
+                        ? ` (${r.recurrence} at ${r.fire_time_local})`
                         : ` (${discordTimestamp(parseSqliteUtc(r.fire_at_utc), 'R')})`;
-                    return `🗑️ **Cancel reminder #${input.id}:** _"${truncate(r.message, 80)}"_${r.recurrence ? ` (${r.recurrence})` : when}`;
+                    return `🗑️ **Cancel reminder #${input.id}:** _"${truncate(r.message, 80)}"_${when}`;
                 }
                 return `🗑️ Cancel reminder #${input.id}`;
             }
@@ -285,17 +287,20 @@ function doListMine(userId, _settings) {
     if (rows.length === 0) {
         return { success: true, message: 'You have no active reminders.' };
     }
-    const lines = rows.map(r => {
-        if (r.recurrence && r.parent_id !== r.id) return null; // skip child instances of recurring rules
+    // Position-based IDs: re-numbered 1..N based on the user's current active list.
+    // The DB AUTOINCREMENT row IDs are hidden — when the user says "cancel #2",
+    // we resolve position 2 against this same list ordering.
+    const lines = rows.map((r, i) => {
+        const position = i + 1;
         if (r.recurrence) {
             const day = r.recurrence === 'weekly' && r.weekday !== null
                 ? `every ${WEEKDAY_NAMES[r.weekday]}`
                 : 'every day';
-            return `#${r.id} — 🔁 ${day} at ${r.fire_time_local} — ${truncate(r.message, 80)}`;
+            return `#${position} — 🔁 ${day} at ${r.fire_time_local} — ${truncate(r.message, 80)}`;
         }
         const utc = parseSqliteUtc(r.fire_at_utc);
-        return `#${r.id} — ⏰ ${discordTimestamp(utc, 'f')} (${discordTimestamp(utc, 'R')}) — ${truncate(r.message, 80)}`;
-    }).filter(Boolean);
+        return `#${position} — ⏰ ${discordTimestamp(utc, 'f')} (${discordTimestamp(utc, 'R')}) — ${truncate(r.message, 80)}`;
+    });
     return { success: true, message: `Your active reminders:\n${lines.join('\n')}` };
 }
 
@@ -319,18 +324,22 @@ async function doSetReminder(input, message, userId, settings) {
         return { success: false, message: 'That time is in the past. Pick a future time.' };
     }
 
-    const id = createOneShot({
+    const dbId = createOneShot({
         guildId: message.guild.id,
         channelId: message.channel.id,
         userId,
         fireAtUtc: toSqliteUtc(utc),
         message: text,
     });
-    scheduleNewReminder(id);
+    scheduleNewReminder(dbId);
+
+    // Resolve display position so the success message uses the same numbering
+    // the user would see in /reminder list.
+    const position = positionFor(userId, dbId);
 
     return {
         success: true,
-        message: `Reminder #${id} set for ${discordTimestamp(utc, 'F')} (${discordTimestamp(utc, 'R')}). I'll ping in this channel.`,
+        message: `Reminder #${position} set for ${discordTimestamp(utc, 'F')} (${discordTimestamp(utc, 'R')}). I'll ping you in this channel.`,
     };
 }
 
@@ -366,7 +375,7 @@ async function doSetRecurring(input, message, userId, settings) {
     // Compute first fire — next occurrence at the local time/weekday from now
     const firstUtc = computeFirstRecurringInstance(settings.timezone, input.recurrence, weekday, input.fire_time_local);
 
-    const id = createRecurring({
+    const dbId = createRecurring({
         guildId: message.guild.id,
         channelId: message.channel.id,
         userId,
@@ -376,37 +385,43 @@ async function doSetRecurring(input, message, userId, settings) {
         weekday,
         fireTimeLocal: input.fire_time_local,
     });
-    scheduleNewReminder(id);
+    scheduleNewReminder(dbId);
 
+    const position = positionFor(userId, dbId);
     const when = input.recurrence === 'weekly'
         ? `every ${WEEKDAY_NAMES[weekday]} at ${input.fire_time_local}`
         : `every day at ${input.fire_time_local}`;
     return {
         success: true,
-        message: `Recurring reminder #${id} set: ${when} (${settings.timezone}). First fire: ${discordTimestamp(firstUtc, 'F')} (${discordTimestamp(firstUtc, 'R')}). Delivery: ${settings.deliveryMode === 'dm' ? 'DM' : 'channel'}.`,
+        message: `Recurring reminder #${position} set: ${when} (${settings.timezone}). First fire: ${discordTimestamp(firstUtc, 'F')} (${discordTimestamp(firstUtc, 'R')}). Delivery: ${settings.deliveryMode === 'dm' ? 'DM' : 'channel'}.`,
     };
 }
 
 function doCancel(input, userId) {
+    // Capture the position BEFORE cancellation (after cancel, the list shrinks)
+    const positionBefore = input.id ? input.id : null;
     const target = resolveTarget(input, userId);
     if (target.error) return { success: false, message: target.error };
 
     const cancelledRows = cancelReminder(target.row.id, userId);
     if (cancelledRows === 0) {
-        return { success: false, message: `Couldn't cancel reminder #${target.row.id}. It may have already fired.` };
+        return { success: false, message: `Couldn't cancel that reminder. It may have already fired.` };
     }
     cancelTimer(target.row.id);
 
+    const ref = positionBefore ? `#${positionBefore}` : `_"${truncate(target.row.message, 60)}"_`;
     return {
         success: true,
-        message: `Cancelled reminder #${target.row.id}: _"${truncate(target.row.message, 80)}"_${target.row.recurrence ? ` (recurring rule + ${cancelledRows - 1} pending instance${cancelledRows - 1 === 1 ? '' : 's'})` : ''}.`,
+        message: `Cancelled reminder ${ref}: _"${truncate(target.row.message, 80)}"_${target.row.recurrence ? ` (recurring rule + ${cancelledRows - 1} pending instance${cancelledRows - 1 === 1 ? '' : 's'})` : ''}.`,
     };
 }
 
 function doReschedule(input, userId, settings) {
+    const positionBefore = input.id ? input.id : null;
     const target = resolveTarget(input, userId);
     if (target.error) return { success: false, message: target.error };
     const row = target.row;
+    const refLabel = positionBefore ? `#${positionBefore}` : `_"${truncate(row.message, 60)}"_`;
 
     if (!settings.timezone || !isValidIANAZone(settings.timezone)) {
         return { success: false, message: 'You need to set your timezone first — run `/timezone <zone>`.' };
@@ -436,7 +451,7 @@ function doReschedule(input, userId, settings) {
             : `every day at ${input.new_fire_time_local}`;
         return {
             success: true,
-            message: `Rescheduled #${row.id} → ${when} (${settings.timezone}). Next fire: ${discordTimestamp(newUtc, 'F')} (${discordTimestamp(newUtc, 'R')}).`,
+            message: `Rescheduled ${refLabel} → ${when} (${settings.timezone}). Next fire: ${discordTimestamp(newUtc, 'F')} (${discordTimestamp(newUtc, 'R')}).`,
         };
     } else {
         // One-shot: must provide new_fire_at_local
@@ -456,25 +471,37 @@ function doReschedule(input, userId, settings) {
         rescheduleTimer(row.id);
         return {
             success: true,
-            message: `Rescheduled #${row.id} → ${discordTimestamp(newUtc, 'F')} (${discordTimestamp(newUtc, 'R')}).`,
+            message: `Rescheduled ${refLabel} → ${discordTimestamp(newUtc, 'F')} (${discordTimestamp(newUtc, 'R')}).`,
         };
     }
 }
 
 function resolveTarget(input, userId) {
     if (input.id) {
-        const row = getReminderById(input.id);
-        if (!row || row.user_id !== userId) return { error: `No reminder #${input.id} found for you.` };
-        if (row.fired_at) return { error: `Reminder #${input.id} already fired.` };
-        if (row.cancelled_at) return { error: `Reminder #${input.id} was already cancelled.` };
-        return { row };
+        // input.id is a 1-indexed POSITION in the user's active list (NOT a DB id).
+        // Re-fetch the active list and pick by index so display IDs always match
+        // what the user just saw in /reminder list or list_my_reminders.
+        const active = getActiveRemindersForUser(userId);
+        const position = input.id;
+        if (!Number.isInteger(position) || position < 1 || position > active.length) {
+            if (active.length === 0) {
+                return { error: `You have no active reminders to reference. List with /reminder list.` };
+            }
+            return { error: `No reminder at position #${position}. You have ${active.length} active reminder${active.length === 1 ? '' : 's'} (numbered 1–${active.length}).` };
+        }
+        return { row: active[position - 1] };
     }
     if (input.query) {
         const matches = findActiveByQuery(userId, input.query, 5);
         if (matches.length === 0) return { error: `No active reminder matches "${input.query}".` };
         if (matches.length > 1) {
-            const list = matches.map(r => `#${r.id} — ${truncate(r.message, 60)}`).join('\n');
-            return { error: `Multiple matches for "${input.query}":\n${list}\n\nWhich one? Tell me the ID.` };
+            // Show position-based IDs so the user can disambiguate without confusion
+            const active = getActiveRemindersForUser(userId);
+            const list = matches.map(m => {
+                const pos = active.findIndex(r => r.id === m.id) + 1;
+                return `#${pos} — ${truncate(m.message, 60)}`;
+            }).join('\n');
+            return { error: `Multiple matches for "${input.query}":\n${list}\n\nWhich one? Tell me the position number.` };
         }
         return { row: matches[0] };
     }
@@ -539,3 +566,14 @@ function computeFirstRecurringInstance(zone, recurrence, weekday, fireTimeLocal)
 }
 
 function pad(n, len = 2) { return String(n).padStart(len, '0'); }
+
+/**
+ * Find the 1-indexed display position of a reminder (by its DB id) in the
+ * user's currently-active list. Used to show the user a stable position
+ * number after creating/rescheduling.
+ */
+function positionFor(userId, dbId) {
+    const active = getActiveRemindersForUser(userId);
+    const idx = active.findIndex(r => r.id === dbId);
+    return idx >= 0 ? idx + 1 : '?';
+}
