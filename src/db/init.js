@@ -12,7 +12,11 @@ const PROJECT_ROOT = join(__dirname, '..', '..');
 const DATA_DIR = process.env.DATA_DIR || PROJECT_ROOT;
 if (!existsSync(DATA_DIR)) mkdirSync(DATA_DIR, { recursive: true });
 
-const DB_PATH = join(DATA_DIR, 'bot.db');
+// Dev uses a separate database file so we can never accidentally touch prod data.
+// Prod (BOT_ENV=production) and any deployment without BOT_ENV use 'bot.db'.
+const BOT_ENV = (process.env.BOT_ENV || 'development').toLowerCase();
+const DB_FILENAME = BOT_ENV === 'development' ? 'bot.dev.db' : 'bot.db';
+const DB_PATH = join(DATA_DIR, DB_FILENAME);
 
 export { DB_PATH, DATA_DIR };
 

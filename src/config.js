@@ -11,7 +11,20 @@ for (const key of required) {
     }
 }
 
+// Bot environment: 'production' (Railway) or 'development' (local). Defaults to development.
+// Used to gate update notices, separate databases, and other env-specific behavior.
+const BOT_ENV = (process.env.BOT_ENV || 'development').toLowerCase();
+if (BOT_ENV !== 'production' && BOT_ENV !== 'development') {
+    console.error(`Invalid BOT_ENV "${process.env.BOT_ENV}" — must be 'production' or 'development'.`);
+    process.exit(1);
+}
+
 const config = Object.freeze({
+    // Environment
+    botEnv: BOT_ENV,
+    isProd: BOT_ENV === 'production',
+    isDev: BOT_ENV === 'development',
+
     // Discord
     discordToken: process.env.DISCORD_TOKEN,
     discordClientId: process.env.DISCORD_CLIENT_ID,
@@ -19,6 +32,9 @@ const config = Object.freeze({
 
     // Anthropic
     anthropicApiKey: process.env.ANTHROPIC_API_KEY,
+
+    // Owner (used to gate /credits add and other owner-only commands)
+    ownerUserId: process.env.OWNER_USER_ID || '',
 
     // Monitoring
     errorChannelId: process.env.ERROR_CHANNEL_ID || '',

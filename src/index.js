@@ -13,6 +13,17 @@ import interactionCreate from './events/interactionCreate.js';
 // Set log level
 logger.setLevel(config.logLevel);
 
+// Log which environment we're running in — visible on every startup
+logger.info('Starting DiVA', {
+    env: config.botEnv,
+    clientId: config.discordClientId,
+    guilds: config.discordGuildIds,
+});
+
+if (config.isDev) {
+    logger.warn('Running in DEVELOPMENT mode — update notices disabled, using dev token');
+}
+
 // Initialize database
 getDb();
 
