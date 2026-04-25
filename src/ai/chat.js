@@ -2,9 +2,11 @@ import anthropic from './client.js';
 import { buildSystemPrompt } from './systemPrompt.js';
 import { saveMessage, getRecentHistory, getChannelMemory } from '../db/history.js';
 import { getPersonality, incrementInteractionCount, shouldRunDigest } from '../db/personality.js';
+import { getUserSettings } from '../db/userSettings.js';
 import { isGuildOutOfCredits, isGuildInSavingMode, getGuildSpendPercent, recordUsage } from '../db/tokenBudget.js';
 import { runPersonalityDigest } from './personality.js';
 import { ADMIN_TOOL_DEFINITIONS, executeAdminTool, isReadOnlyTool, formatToolForConfirmation, recordUndoableAction, getUndoableActions, clearUndoActions, executeUndo } from './adminTools.js';
+import { USER_TOOL_DEFINITIONS, executeUserTool, isUserTool, isReadOnlyUserTool, formatUserToolForConfirmation } from './userTools.js';
 import config from '../config.js';
 import logger from '../utils/logger.js';
 import { PermissionsBitField, ActionRowBuilder, ButtonBuilder, ButtonStyle, ComponentType } from 'discord.js';
@@ -17,7 +19,7 @@ const ADMIN_MAX_TOKENS = 4096; // Higher token limit for admin tool requests to 
 // Model routing — Haiku for simple messages, Sonnet for complex
 const MODEL_SONNET = 'claude-sonnet-4-6';
 const MODEL_HAIKU = 'claude-haiku-4-5-20251001';
-const COMPLEX_INDICATORS = /\b(explain|analyze|compare|how does|why does|write|code|debug|review|create|help me|build|implement|summarize|describe|what happened|tell me about)\b/i;
+const COMPLEX_INDICATORS = /\b(explain|analyze|compare|how does|why does|write|code|debug|review|create|help me|build|implement|summarize|describe|what happened|tell me about|remind me|reminder|every day|every week|tomorrow|schedule)\b/i;
 const SIMPLE_MAX_LENGTH = 200; // Messages under this length with no complex indicators use Haiku
 
 const SAVING_MODE_WARNING = "\n\n\u26A0\uFE0F *Budget is above 85% for the month — web search and image analysis are disabled to conserve tokens.*";
@@ -152,11 +154,17 @@ async function buildReplyChain(message, client, maxMessages = 3) {
 }
 
 /**
- * Send a confirmation message with buttons for admin tool actions.
+ * Send a confirmation message with buttons for admin OR user tool actions.
+ * Both go through the same UX. The formatter is dispatched per block based on
+ * whether the tool is an admin or user tool.
  * Returns { confirmed: boolean, confirmMsgId: string | null }
  */
-async function requestAdminConfirmation(message, toolBlocks) {
-    const actionLines = toolBlocks.map(b => formatToolForConfirmation(b.name, b.input));
+async function requestToolConfirmation(message, toolBlocks) {
+    const userId = message.author.id;
+    const actionLines = toolBlocks.map(b => {
+        if (isUserTool(b.name)) return formatUserToolForConfirmation(b.name, b.input, userId);
+        return formatToolForConfirmation(b.name, b.input);
+    });
     const description = actionLines.length === 1
         ? `I'll perform the following action:\n\n${actionLines[0]}`
         : `I'll perform the following **${actionLines.length} actions**:\n\n${actionLines.join('\n')}`;
@@ -333,7 +341,17 @@ export async function chat(message, client) {
         channelMemoryText = `\n\nRecent conversations in this channel:\n${lines.join('\n---\n')}\n\nUse this context if relevant, but don't reference it unprompted.`;
     }
 
-    const systemPromptText = buildSystemPrompt({ userName, guildName, personalityPrompt, isAdmin: memberIsAdmin }) + channelMemoryText;
+    // User context for the reminder tools (timezone + delivery prefs)
+    const userSettings = getUserSettings(userId);
+
+    const systemPromptText = buildSystemPrompt({
+        userName,
+        guildName,
+        personalityPrompt,
+        isAdmin: memberIsAdmin,
+        userTimezone: userSettings.timezone,
+        userHasDeliveryPrefs: !!userSettings.deliveryMode,
+    }) + channelMemoryText;
 
     const currentContent = buildUserContent(
         userContent || (allImages.length > 0 ? '(shared an image)' : ''),
@@ -356,6 +374,10 @@ export async function chat(message, client) {
         });
     }
 
+    // User tools (reminders) are available to EVERYONE.
+    tools.push(...USER_TOOL_DEFINITIONS);
+
+    // Admin tools layered on top for admins.
     if (memberIsAdmin) {
         tools.push(...ADMIN_TOOL_DEFINITIONS);
     }
@@ -402,35 +424,59 @@ export async function chat(message, client) {
             rounds++;
 
             const toolUseBlocks = response.content.filter(b => b.type === 'tool_use');
-            const adminToolBlocks = toolUseBlocks.filter(b => b.name !== 'web_search');
+            // Strip web_search (server-side, no executor needed) — keep everything else for our routing
+            const customBlocks = toolUseBlocks.filter(b => b.name !== 'web_search');
 
-            if (adminToolBlocks.length === 0) break;
+            if (customBlocks.length === 0) break;
 
-            // Check admin rate limit before executing any tools
-            const rateCheck = checkAdminRateLimit(guildId);
-            if (!rateCheck.allowed) {
-                const retrySeconds = Math.ceil(rateCheck.retryAfterMs / 1000);
-                // Return rate limit as tool results so Claude can inform the user
-                for (const toolUse of adminToolBlocks) {
-                    messages.push({ role: 'assistant', content: response.content });
-                    messages.push({ role: 'user', content: [{
-                        type: 'tool_result',
-                        tool_use_id: toolUse.id,
-                        content: `Rate limited — too many admin actions. Try again in ${retrySeconds} seconds.`,
-                        is_error: true,
-                    }] });
-                }
+            // Split by tool category
+            const adminBlocks = customBlocks.filter(b => !isUserTool(b.name));
+            const userBlocks = customBlocks.filter(b => isUserTool(b.name));
+
+            // If a non-admin somehow triggered an admin tool block, refuse politely
+            if (adminBlocks.length > 0 && !memberIsAdmin) {
+                messages.push({ role: 'assistant', content: response.content });
+                messages.push({ role: 'user', content: adminBlocks.map(b => ({
+                    type: 'tool_result',
+                    tool_use_id: b.id,
+                    content: 'That action requires server admin permissions. The user is not an admin.',
+                    is_error: true,
+                })).concat(userBlocks.map(b => ({
+                    type: 'tool_result',
+                    tool_use_id: b.id,
+                    content: 'Skipped — combined call had admin tools the user cannot use.',
+                    is_error: true,
+                }))) });
                 break;
             }
 
-            // Separate read-only tools (no confirmation needed) from write tools
-            const readOnlyBlocks = adminToolBlocks.filter(b => isReadOnlyTool(b.name));
-            const writeBlocks = adminToolBlocks.filter(b => !isReadOnlyTool(b.name));
+            // Apply admin rate limit only when admin tools were called
+            if (adminBlocks.length > 0) {
+                const rateCheck = checkAdminRateLimit(guildId);
+                if (!rateCheck.allowed) {
+                    const retrySeconds = Math.ceil(rateCheck.retryAfterMs / 1000);
+                    messages.push({ role: 'assistant', content: response.content });
+                    messages.push({ role: 'user', content: customBlocks.map(b => ({
+                        type: 'tool_result',
+                        tool_use_id: b.id,
+                        content: `Rate limited — too many admin actions. Try again in ${retrySeconds} seconds.`,
+                        is_error: true,
+                    })) });
+                    break;
+                }
+            }
 
+            // Separate read-only from write across both categories
+            const adminReadOnly = adminBlocks.filter(b => isReadOnlyTool(b.name));
+            const adminWrite = adminBlocks.filter(b => !isReadOnlyTool(b.name));
+            const userReadOnly = userBlocks.filter(b => isReadOnlyUserTool(b.name));
+            const userWrite = userBlocks.filter(b => !isReadOnlyUserTool(b.name));
+
+            const writeBlocks = [...adminWrite, ...userWrite];
             const toolResults = [];
 
-            // Execute read-only tools immediately (list_channels, list_roles)
-            for (const toolUse of readOnlyBlocks) {
+            // Execute read-only tools immediately
+            for (const toolUse of adminReadOnly) {
                 const result = await executeAdminTool(toolUse.name, toolUse.input, message.guild, userId);
                 toolResults.push({
                     type: 'tool_result',
@@ -439,37 +485,51 @@ export async function chat(message, client) {
                 });
                 recordAdminToolCall(guildId);
             }
+            for (const toolUse of userReadOnly) {
+                const result = await executeUserTool(toolUse.name, toolUse.input, message, userId);
+                toolResults.push({
+                    type: 'tool_result',
+                    tool_use_id: toolUse.id,
+                    content: result.message,
+                });
+            }
 
-            // Write tools need confirmation
+            // Write tools need confirmation (single combined card if mixed admin + user)
             if (writeBlocks.length > 0) {
-                const { confirmed, confirmMsgId, confirmMsg: cMsg, description } = await requestAdminConfirmation(message, writeBlocks);
+                const { confirmed, confirmMsgId, confirmMsg: cMsg, description } = await requestToolConfirmation(message, writeBlocks);
 
                 if (confirmed) {
                     let hasUndoableActions = false;
 
                     for (const toolUse of writeBlocks) {
-                        const result = await executeAdminTool(toolUse.name, toolUse.input, message.guild, userId);
+                        let result;
+                        if (isUserTool(toolUse.name)) {
+                            result = await executeUserTool(toolUse.name, toolUse.input, message, userId);
+                        } else {
+                            result = await executeAdminTool(toolUse.name, toolUse.input, message.guild, userId);
+                            recordAdminToolCall(guildId);
+
+                            // Only admin tools have undo metadata
+                            if (result.undo) {
+                                recordUndoableAction(guildId, userId, confirmMsgId, result.undo);
+                                hasUndoableActions = true;
+                            }
+                            if (result.undoMulti) {
+                                for (const u of result.undoMulti) {
+                                    recordUndoableAction(guildId, userId, confirmMsgId, u);
+                                }
+                                hasUndoableActions = true;
+                            }
+                        }
+
                         toolResults.push({
                             type: 'tool_result',
                             tool_use_id: toolUse.id,
                             content: result.message,
                         });
-                        recordAdminToolCall(guildId);
-
-                        // Record undo metadata
-                        if (result.undo) {
-                            recordUndoableAction(guildId, userId, confirmMsgId, result.undo);
-                            hasUndoableActions = true;
-                        }
-                        if (result.undoMulti) {
-                            for (const u of result.undoMulti) {
-                                recordUndoableAction(guildId, userId, confirmMsgId, u);
-                            }
-                            hasUndoableActions = true;
-                        }
                     }
 
-                    // Attach undo button (fire-and-forget, don't block the response)
+                    // Attach undo button (fire-and-forget) — only for admin actions
                     if (hasUndoableActions && cMsg) {
                         undoButtonPromises.push(
                             attachUndoButton(cMsg, description, guildId, userId, confirmMsgId, message.guild)

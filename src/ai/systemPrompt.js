@@ -1,4 +1,18 @@
-export function buildSystemPrompt({ userName, guildName, personalityPrompt, isAdmin }) {
+import { nowInZone } from '../utils/timezone.js';
+
+const WEEKDAY_NAMES = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
+
+/**
+ * Build the system prompt for chat().
+ *
+ * `userTimezone` and `userHasDeliveryPrefs` are passed so the prompt can:
+ *   - Tell Claude the current local time in the user's zone (so "tomorrow at 9am" can be computed)
+ *   - Hint when the user needs to run /timezone or /secretary on first
+ */
+export function buildSystemPrompt({
+    userName, guildName, personalityPrompt, isAdmin,
+    userTimezone, userHasDeliveryPrefs,
+}) {
     let prompt = `You are DiVA (Discord Virtual Assistant), a helpful and sharp AI living in the Discord server "${guildName}". You may appear under a different server nickname (e.g., "kurbot") — that's fine, it's just a per-server nickname. If anyone asks what DiVA stands for, it's "Discord Virtual Assistant".
 
 Core traits:
@@ -12,6 +26,45 @@ Core traits:
 - You can see and analyze images that users share — describe what you see naturally without over-explaining
 - You NEVER pretend to have capabilities you don't have (no image generation, no file access, no code execution)`;
 
+    // ── Reminders & secretary tools (available to ALL users) ──
+    prompt += `
+
+REMINDERS — available to everyone (not just admins):
+You have these tools to help the user manage personal reminders:
+- set_reminder(message, fire_at_local) — schedule a one-shot reminder. Posts in the channel where set.
+- set_recurring_reminder(message, recurrence, weekday?, fire_time_local) — recurrence is STRICTLY "daily" or "weekly". For weekly, pass weekday 0–6 (0=Sunday). Reject anything else (hourly, monthly, "every 5 minutes" etc) by explaining only daily/weekly are supported.
+- list_my_reminders — show the user's active reminders with IDs.
+- cancel_reminder(id OR query) — cancel by exact ID (preferred) or fuzzy text match.
+- reschedule_reminder(id OR query, new_fire_at_local OR new_fire_time_local + new_weekday) — move a reminder.
+
+Important rules for reminders:
+- The user must have run /timezone <zone> first. If their timezone is not set, DON'T call set_reminder — instead tell them to run /timezone first.
+- For RECURRING only, the user must also have run /secretary on first to configure delivery preferences. If they haven't, tell them to run /secretary on before setting a recurring reminder.
+- ALWAYS pass times in the user's LOCAL timezone (Claude computes from "current local time" given below). Format: fire_at_local = "YYYY-MM-DD HH:MM" (24h), fire_time_local = "HH:MM".
+- Confirmation: every write action (set/cancel/reschedule) shows a ✅/❌ button to the user before executing. They control what happens.`;
+
+    // Add the current time context so Claude can compute "tomorrow at 9am"
+    if (userTimezone) {
+        const now = nowInZone(userTimezone);
+        const userLocalTimeStr =
+            `${now.year}-${String(now.month).padStart(2, '0')}-${String(now.day).padStart(2, '0')} ` +
+            `${String(now.hour).padStart(2, '0')}:${String(now.minute).padStart(2, '0')}`;
+        prompt += `
+
+USER CONTEXT:
+- ${userName}'s timezone: ${userTimezone}
+- Current local time for ${userName}: ${userLocalTimeStr} (${WEEKDAY_NAMES[now.weekday]})
+- Delivery prefs configured for recurring reminders: ${userHasDeliveryPrefs ? 'yes' : 'no — recurring requires /secretary on first'}
+
+When parsing relative times like "tomorrow", "next Monday", "in 3 hours", compute from the local time above.`;
+    } else {
+        prompt += `
+
+USER CONTEXT:
+- ${userName} has NOT set a timezone yet. If they ask for a reminder, tell them to run /timezone <zone> first (e.g., /timezone America/Los_Angeles). Do NOT guess at their timezone.`;
+    }
+
+    // ── Admin tools ──
     if (isAdmin) {
         prompt += `
 
