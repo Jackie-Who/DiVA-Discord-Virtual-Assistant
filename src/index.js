@@ -6,6 +6,7 @@ import { getDb } from './db/init.js';
 import { startBackupScheduler } from './utils/backup.js';
 import { cleanupExpiredUndoActions } from './ai/adminTools.js';
 import { initWeeklyMetrics } from './utils/weeklyMetrics.js';
+import { initReminderScheduler } from './utils/reminderScheduler.js';
 // runUpdateNotifier is wired through ready.js so it fires after Discord login
 import ready from './events/ready.js';
 import messageCreate from './events/messageCreate.js';
@@ -50,6 +51,10 @@ initErrorNotifier(client);
 
 // Initialize weekly metrics (Sunday 9 PM Pacific)
 initWeeklyMetrics(client);
+
+// Initialize the reminder scheduler — loads pending reminders within 24h on startup,
+// hourly sweep keeps the in-memory timer Map in sync with SQLite.
+initReminderScheduler(client);
 
 // Register event handlers
 ready(client);
