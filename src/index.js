@@ -6,6 +6,7 @@ import { getDb } from './db/init.js';
 import { startBackupScheduler } from './utils/backup.js';
 import { cleanupExpiredUndoActions } from './ai/adminTools.js';
 import { initWeeklyMetrics } from './utils/weeklyMetrics.js';
+// runUpdateNotifier is wired through ready.js so it fires after Discord login
 import ready from './events/ready.js';
 import messageCreate from './events/messageCreate.js';
 import interactionCreate from './events/interactionCreate.js';
