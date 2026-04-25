@@ -123,6 +123,7 @@ export default function messageCreate(client) {
             await notifyError({
                 title: 'Message Handler Error',
                 error,
+                guildId: message.guild?.id,
                 context: {
                     guild: message.guild?.id,
                     channel: message.channel.id,

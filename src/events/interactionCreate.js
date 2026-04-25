@@ -1,6 +1,7 @@
 import logger from '../utils/logger.js';
 import budget from '../commands/budget.js';
 import credits from '../commands/credits.js';
+import channel from '../commands/channels.js';
 import personality from '../commands/personality.js';
 
 // Note: as of v1.2 we removed /create-channel, /delete-channel, /ban, /kick, /purge —
@@ -13,6 +14,7 @@ import personality from '../commands/personality.js';
 const commands = {
     budget,
     credits,
+    channel,
     personality,
 };
 

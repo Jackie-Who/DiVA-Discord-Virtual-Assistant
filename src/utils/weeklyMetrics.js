@@ -7,6 +7,8 @@
 
 import { getDb } from '../db/init.js';
 // (token budget imports removed in v1.2 — credit data is queried directly below)
+import { getAllGuildsWithWeeklyMetrics } from '../db/guildChannels.js';
+import { getGuildCreditUsage } from '../db/credits.js';
 import config from '../config.js';
 import logger from './logger.js';
 
@@ -242,7 +244,98 @@ function formatMetricsMessage(metrics) {
 }
 
 /**
- * Send the weekly metrics to the configured channel.
+ * Send a long message split across multiple Discord posts (2000 char limit each).
+ */
+async function sendChunked(channel, message) {
+    if (message.length <= 2000) {
+        await channel.send(message);
+        return;
+    }
+    const parts = [];
+    let remaining = message;
+    while (remaining.length > 0) {
+        if (remaining.length <= 2000) { parts.push(remaining); break; }
+        let splitAt = remaining.lastIndexOf('\n\n', 2000);
+        if (splitAt < 500) splitAt = remaining.lastIndexOf('\n', 2000);
+        if (splitAt < 500) splitAt = 2000;
+        parts.push(remaining.slice(0, splitAt));
+        remaining = remaining.slice(splitAt).trimStart();
+    }
+    for (const part of parts) await channel.send(part);
+}
+
+/**
+ * Build a per-guild weekly report (only that guild's data).
+ */
+function gatherGuildMetrics(guildId) {
+    const db = getDb();
+
+    const weekStats = db.prepare(`
+        SELECT
+            COUNT(*) as total_calls,
+            COALESCE(SUM(input_tokens), 0) as total_input,
+            COALESCE(SUM(output_tokens), 0) as total_output,
+            COALESCE(SUM(cost_usd), 0) as total_cost,
+            COUNT(DISTINCT user_id) as active_users
+        FROM token_usage
+        WHERE guild_id = ? AND created_at > datetime('now', '-7 days')
+    `).get(guildId);
+
+    const dailyBreakdown = db.prepare(`
+        SELECT DATE(created_at) AS day, COUNT(*) AS calls, SUM(cost_usd) AS cost
+        FROM token_usage
+        WHERE guild_id = ? AND created_at > datetime('now', '-7 days')
+        GROUP BY DATE(created_at)
+        ORDER BY day DESC
+    `).all(guildId);
+
+    const credits = getGuildCreditUsage(guildId);
+
+    return { weekStats, dailyBreakdown, credits };
+}
+
+function formatGuildMetrics(guildName, m) {
+    const { weekStats, dailyBreakdown, credits } = m;
+    const avgCost = weekStats.total_calls > 0
+        ? (weekStats.total_cost / weekStats.total_calls).toFixed(4)
+        : '0.00';
+
+    let msg = `# 📊 Weekly Bot Metrics — ${guildName}\n\n`;
+    msg += `## This Week\n`;
+    msg += `- **API Calls:** ${weekStats.total_calls.toLocaleString()}\n`;
+    msg += `- **Active Users:** ${weekStats.active_users}\n`;
+    msg += `- **Cost:** $${weekStats.total_cost.toFixed(4)}\n`;
+    msg += `- **Avg Cost/Call:** $${avgCost}\n\n`;
+
+    if (dailyBreakdown.length > 0) {
+        msg += `## Daily Breakdown\n\`\`\`\n`;
+        msg += `Date        │ Calls │ Cost\n`;
+        msg += `────────────┼───────┼─────────\n`;
+        for (const day of dailyBreakdown) {
+            msg += `${day.day.padEnd(12)}│${String(day.calls).padStart(5)} │$${day.cost.toFixed(4).padStart(8)}\n`;
+        }
+        msg += `\`\`\`\n\n`;
+    }
+
+    msg += `## Credit Balance\n`;
+    if (credits.ownerManaged) {
+        msg += `_Owner-managed — no credit limit applies._\n`;
+    } else {
+        msg += `- **Lifetime Granted:** $${credits.lifetimeCreditsUsd.toFixed(4)}\n`;
+        msg += `- **Spent:** $${credits.totalSpentUsd.toFixed(4)}\n`;
+        msg += `- **Remaining:** $${credits.remainingUsd.toFixed(4)}\n`;
+        if (credits.lifetimeCreditsUsd > 0) {
+            const pct = (credits.totalSpentUsd / credits.lifetimeCreditsUsd) * 100;
+            if (pct >= 85) msg += `\n⚠️ **Saving mode is active** (web search + image analysis disabled).`;
+        }
+    }
+    return msg;
+}
+
+/**
+ * Send the weekly metrics:
+ *   1. Global owner report → config.metricsChannelId (your monitoring channel)
+ *   2. Per-guild reports → each opt-in guild's metrics_channel_id
  */
 async function sendWeeklyMetrics() {
     if (!metricsClient) {
@@ -250,42 +343,48 @@ async function sendWeeklyMetrics() {
         return;
     }
 
+    // (1) Global owner report
+    if (config.metricsChannelId) {
+        try {
+            const channel = await metricsClient.channels.fetch(config.metricsChannelId);
+            if (channel) {
+                const metrics = gatherMetrics();
+                await sendChunked(channel, formatMetricsMessage(metrics));
+                logger.info('Owner weekly metrics sent', { channelId: config.metricsChannelId });
+            } else {
+                logger.error('Owner metrics channel not found', { channelId: config.metricsChannelId });
+            }
+        } catch (err) {
+            logger.error('Failed to send owner weekly metrics', { error: err.message });
+        }
+    }
+
+    // (2) Per-guild opt-in reports
+    let guildOptIns = [];
     try {
-        const channel = await metricsClient.channels.fetch(config.metricsChannelId);
-        if (!channel) {
-            logger.error('Metrics channel not found', { channelId: config.metricsChannelId });
-            return;
-        }
-
-        const metrics = gatherMetrics();
-        const message = formatMetricsMessage(metrics);
-
-        // Discord 2000 char limit — split if needed
-        if (message.length <= 2000) {
-            await channel.send(message);
-        } else {
-            // Split on double newlines
-            const parts = [];
-            let remaining = message;
-            while (remaining.length > 0) {
-                if (remaining.length <= 2000) {
-                    parts.push(remaining);
-                    break;
-                }
-                let splitAt = remaining.lastIndexOf('\n\n', 2000);
-                if (splitAt < 500) splitAt = remaining.lastIndexOf('\n', 2000);
-                if (splitAt < 500) splitAt = 2000;
-                parts.push(remaining.slice(0, splitAt));
-                remaining = remaining.slice(splitAt).trimStart();
-            }
-            for (const part of parts) {
-                await channel.send(part);
-            }
-        }
-
-        logger.info('Weekly metrics sent', { channelId: config.metricsChannelId });
+        guildOptIns = getAllGuildsWithWeeklyMetrics();
     } catch (err) {
-        logger.error('Failed to send weekly metrics', { error: err.message, stack: err.stack });
+        logger.error('Failed to query guilds opted into weekly metrics', { error: err.message });
+        return;
+    }
+
+    for (const opt of guildOptIns) {
+        try {
+            const channel = await metricsClient.channels.fetch(opt.metrics_channel_id);
+            if (!channel) {
+                logger.warn('Per-guild metrics channel not found, skipping', { guildId: opt.guild_id });
+                continue;
+            }
+            const metrics = gatherGuildMetrics(opt.guild_id);
+            const guildName = channel.guild?.name || opt.guild_id;
+            await sendChunked(channel, formatGuildMetrics(guildName, metrics));
+            logger.info('Per-guild weekly metrics sent', { guildId: opt.guild_id });
+        } catch (err) {
+            logger.error('Failed to send per-guild weekly metrics', {
+                guildId: opt.guild_id,
+                error: err.message,
+            });
+        }
     }
 }
 

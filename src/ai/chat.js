@@ -548,6 +548,7 @@ export async function chat(message, client) {
         await notifyError({
             title: 'Anthropic API Error',
             error,
+            guildId,
             context: { guild: guildId, channel: channelId, user: userId, status: error.status },
         });
 

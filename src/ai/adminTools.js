@@ -711,6 +711,7 @@ export async function executeAdminTool(toolName, input, guild, userId) {
         await notifyError({
             title: 'Unknown tool attempted',
             error: new Error(`Tool "${toolName}" is not in the allowlist`),
+            guildId: guild.id,
             context: { guild: guild.id, user: userId, tool: toolName },
         });
         return { success: false, message: 'That action is not available.' };
@@ -721,6 +722,7 @@ export async function executeAdminTool(toolName, input, guild, userId) {
         await notifyError({
             title: 'Admin permission lost during tool chain',
             error: new Error('User no longer has admin permissions'),
+            guildId: guild.id,
             context: { guild: guild.id, user: userId, tool: toolName },
         });
         return { success: false, message: 'You no longer have admin permissions to perform this action.' };
@@ -1126,6 +1128,7 @@ export async function executeAdminTool(toolName, input, guild, userId) {
         await notifyError({
             title: `Admin tool failed: ${toolName}`,
             error,
+            guildId: guild.id,
             context: { guild: guild.id, user: userId, tool: toolName, input: JSON.stringify(input).slice(0, 300) },
         });
         return { success: false, message: 'Something went wrong executing that action. The error has been reported.' };
