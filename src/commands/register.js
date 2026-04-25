@@ -1,57 +1,28 @@
-import { REST, Routes, SlashCommandBuilder, ChannelType, PermissionFlagsBits } from 'discord.js';
+import { REST, Routes, SlashCommandBuilder, PermissionFlagsBits } from 'discord.js';
 import config from '../config.js';
 
 const commands = [
-    new SlashCommandBuilder()
-        .setName('create-channel')
-        .setDescription('Create a new text channel')
-        .addStringOption(opt => opt.setName('name').setDescription('Channel name').setRequired(true))
-        .addChannelOption(opt =>
-            opt.setName('category')
-                .setDescription('Category to create the channel under')
-                .addChannelTypes(ChannelType.GuildCategory)
-        )
-        .setDefaultMemberPermissions(PermissionFlagsBits.ManageChannels),
-
-    new SlashCommandBuilder()
-        .setName('delete-channel')
-        .setDescription('Delete a text channel')
-        .addChannelOption(opt =>
-            opt.setName('channel')
-                .setDescription('Channel to delete')
-                .setRequired(true)
-        )
-        .setDefaultMemberPermissions(PermissionFlagsBits.ManageChannels),
-
-    new SlashCommandBuilder()
-        .setName('ban')
-        .setDescription('Ban a user from the server')
-        .addUserOption(opt => opt.setName('user').setDescription('User to ban').setRequired(true))
-        .addStringOption(opt => opt.setName('reason').setDescription('Reason for the ban'))
-        .setDefaultMemberPermissions(PermissionFlagsBits.BanMembers),
-
-    new SlashCommandBuilder()
-        .setName('kick')
-        .setDescription('Kick a user from the server')
-        .addUserOption(opt => opt.setName('user').setDescription('User to kick').setRequired(true))
-        .addStringOption(opt => opt.setName('reason').setDescription('Reason for the kick'))
-        .setDefaultMemberPermissions(PermissionFlagsBits.KickMembers),
-
-    new SlashCommandBuilder()
-        .setName('purge')
-        .setDescription('Delete multiple messages')
-        .addIntegerOption(opt =>
-            opt.setName('count')
-                .setDescription('Number of messages to delete (1-100)')
-                .setRequired(true)
-                .setMinValue(1)
-                .setMaxValue(100)
-        )
-        .setDefaultMemberPermissions(PermissionFlagsBits.ManageMessages),
+    // Bot-specific commands. Discord-native operations (ban/kick/purge/create-channel/
+    // delete-channel) were intentionally removed in v1.2 — Discord's own UI handles them
+    // better, and the bot's natural-language admin tools cover the same actions when needed.
 
     new SlashCommandBuilder()
         .setName('budget')
-        .setDescription('Check the bot\'s monthly API token budget'),
+        .setDescription('Show this server\'s credit balance and recent spend'),
+
+    new SlashCommandBuilder()
+        .setName('credits')
+        .setDescription('Manage this server\'s credits')
+        .addSubcommand(sub =>
+            sub.setName('show').setDescription('Show this server\'s credit balance')
+        )
+        .addSubcommand(sub =>
+            sub.setName('add')
+                .setDescription('Owner only — add credits to a server')
+                .addStringOption(opt => opt.setName('guild_id').setDescription('Target guild ID').setRequired(true))
+                .addNumberOption(opt => opt.setName('amount').setDescription('USD to add').setRequired(true).setMinValue(0.01))
+                .addStringOption(opt => opt.setName('note').setDescription('Reason / reference'))
+        ),
 
     new SlashCommandBuilder()
         .setName('personality')
@@ -63,6 +34,81 @@ const commands = [
             sub.setName('reset').setDescription('Reset the personality to start fresh')
         )
         .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
+
+    new SlashCommandBuilder()
+        .setName('timezone')
+        .setDescription('Set your timezone (used for reminders and the daily digest)')
+        .addStringOption(opt =>
+            opt.setName('zone')
+                .setDescription('IANA timezone name, e.g., America/Los_Angeles')
+                .setRequired(true)
+        ),
+
+    new SlashCommandBuilder()
+        .setName('reminder')
+        .setDescription('Manage your reminders')
+        .addSubcommand(sub =>
+            sub.setName('list').setDescription('List your active reminders')
+        )
+        .addSubcommand(sub =>
+            sub.setName('delete')
+                .setDescription('Delete a reminder by ID')
+                .addIntegerOption(opt => opt.setName('id').setDescription('Reminder ID (from /reminder list)').setRequired(true))
+        ),
+
+    new SlashCommandBuilder()
+        .setName('secretary')
+        .setDescription('Configure your personal preferences (delivery, daily digest)')
+        .addSubcommand(sub =>
+            sub.setName('on').setDescription('Set up or update your preferences')
+        )
+        .addSubcommand(sub =>
+            sub.setName('off').setDescription('Disable the daily digest (recurring reminders keep working)')
+        )
+        .addSubcommand(sub =>
+            sub.setName('status').setDescription('Show your current preferences')
+        )
+        .addSubcommand(sub =>
+            sub.setName('clear').setDescription('Clear all your preferences (also stops recurring reminders)')
+        ),
+
+    new SlashCommandBuilder()
+        .setName('channel')
+        .setDescription('Configure server-side channels for bot notifications')
+        .addSubcommand(sub =>
+            sub.setName('set')
+                .setDescription('Route a notification kind to a channel')
+                .addStringOption(opt =>
+                    opt.setName('kind')
+                        .setDescription('Which kind of notification')
+                        .setRequired(true)
+                        .addChoices(
+                            { name: 'error', value: 'error' },
+                            { name: 'metrics', value: 'metrics' },
+                            { name: 'notices', value: 'notices' },
+                        )
+                )
+                .addChannelOption(opt =>
+                    opt.setName('channel')
+                        .setDescription('Target channel')
+                        .setRequired(true)
+                )
+        )
+        .addSubcommand(sub =>
+            sub.setName('show').setDescription('Show current channel configuration')
+        )
+        .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
+
+    new SlashCommandBuilder()
+        .setName('notices')
+        .setDescription('Toggle update notices for this server')
+        .addSubcommand(sub =>
+            sub.setName('on').setDescription('Enable update notices (default)')
+        )
+        .addSubcommand(sub =>
+            sub.setName('off').setDescription('Disable update notices')
+        )
+        .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
 ];
 
 const rest = new REST({ version: '10' }).setToken(config.discordToken);
