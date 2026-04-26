@@ -18,11 +18,12 @@ export const BOT_VERSION = '1.2.0';
 export const CHANGELOG = {
     '1.2.0': [
         'Per-server credit billing replaces the global monthly budget',
-        'New `/credits` command shows your server\'s balance and recent transactions',
-        'New `/timezone` command for per-user timezone settings',
-        'New `/reminder` and `/secretary` commands — set reminders in plain English',
-        'New `/channel` command for routing errors, metrics, and notices to your own channels',
-        'New `/notices on/off` to control update announcements',
-        'Removed `/create-channel`, `/delete-channel`, `/ban`, `/kick`, `/purge` — Discord\'s built-in UI handles those better',
+        'New `/credits` to view your server\'s balance and recent transactions',
+        'New `/timezone` for per-user timezone — or just say "set my timezone to vancouver"',
+        '**Natural-language reminders!** "Remind me about groceries in 3 hours" — and a ✨ AI-suggested title button',
+        'Daily digest with `/secretary on` — get your day\'s reminders pinged at a time you choose',
+        'New `/channel set` to route errors, metrics, and update notices to your own channels',
+        'New `/notices on/off` to opt out of these announcements',
+        'Removed `/create-channel`, `/delete-channel`, `/ban`, `/kick`, `/purge` — Discord\'s native UI is faster',
     ],
 };
