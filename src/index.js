@@ -7,6 +7,7 @@ import { startBackupScheduler } from './utils/backup.js';
 import { cleanupExpiredUndoActions } from './ai/adminTools.js';
 import { initWeeklyMetrics } from './utils/weeklyMetrics.js';
 import { initReminderScheduler } from './utils/reminderScheduler.js';
+import { initSecretaryScheduler } from './utils/secretaryScheduler.js';
 // runUpdateNotifier is wired through ready.js so it fires after Discord login
 import ready from './events/ready.js';
 import messageCreate from './events/messageCreate.js';
@@ -55,6 +56,10 @@ initWeeklyMetrics(client);
 // Initialize the reminder scheduler — loads pending reminders within 24h on startup,
 // hourly sweep keeps the in-memory timer Map in sync with SQLite.
 initReminderScheduler(client);
+
+// Initialize the secretary mode daily-digest scheduler — polls every 5 min,
+// fires each opted-in user's digest within ±2.5 min of their chosen local time.
+initSecretaryScheduler(client);
 
 // Register event handlers
 ready(client);

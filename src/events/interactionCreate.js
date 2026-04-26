@@ -5,6 +5,7 @@ import channel from '../commands/channels.js';
 import notices from '../commands/notices.js';
 import timezone from '../commands/timezone.js';
 import reminder from '../commands/reminder.js';
+import secretary from '../commands/secretary.js';
 import personality from '../commands/personality.js';
 
 // Note: as of v1.2 we removed /create-channel, /delete-channel, /ban, /kick, /purge —
@@ -21,6 +22,7 @@ const commands = {
     notices,
     timezone,
     reminder,
+    secretary,
     personality,
 };
 
