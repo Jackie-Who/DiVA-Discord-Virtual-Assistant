@@ -326,9 +326,10 @@ export async function chat(message, client) {
     const hasAnyImages = allImages.length > 0 || message.attachments.size > 0 || replyChain.images.length > 0;
 
     if (!userContent && allImages.length === 0) {
-        return savingMode && hasAnyImages
+        const text = savingMode && hasAnyImages
             ? "I can see you shared an image, but image analysis is disabled right now to conserve my monthly budget." + SAVING_MODE_WARNING
             : "Hey! Did you mean to say something?";
+        return { text, aiSuggestions: [] };
     }
 
     const personalityPrompt = getPersonality(guildId);
@@ -424,6 +425,10 @@ export async function chat(message, client) {
         // after seeing a success result. Within a single round, all writes are
         // allowed — Claude is allowed to plan multiple tools in one response.
         let writesInPreviousRounds = false;
+        // AI title suggestions yielded by reminder tool calls in this turn.
+        // Surfaced to messageCreate.js so it can attach a "✨ Use suggested" button
+        // to the bot's final reply.
+        const aiSuggestions = [];
 
         while (response.stop_reason === 'tool_use' && rounds < MAX_TOOL_ROUNDS) {
             rounds++;
@@ -545,6 +550,7 @@ export async function chat(message, client) {
                         tool_use_id: toolUse.id,
                         content: result.message,
                     });
+                    if (result.aiSuggestion) aiSuggestions.push(result.aiSuggestion);
                     didWriteThisRound = true;
                 }
 
@@ -560,6 +566,7 @@ export async function chat(message, client) {
                             let result;
                             if (isUserTool(toolUse.name)) {
                                 result = await executeUserTool(toolUse.name, toolUse.input, message, userId);
+                                if (result.aiSuggestion) aiSuggestions.push(result.aiSuggestion);
                             } else {
                                 result = await executeAdminTool(toolUse.name, toolUse.input, message.guild, userId);
                                 recordAdminToolCall(guildId);
@@ -656,7 +663,7 @@ export async function chat(message, client) {
             isAdmin: memberIsAdmin,
         });
 
-        return responseText;
+        return { text: responseText, aiSuggestions };
     } catch (error) {
         logger.error('Anthropic API error', {
             guild: guildId,
@@ -674,11 +681,11 @@ export async function chat(message, client) {
         });
 
         if (error.status === 429) {
-            return "I need a quick breather, try again in a sec \u{1F605}";
+            return { text: "I need a quick breather, try again in a sec \u{1F605}", aiSuggestions: [] };
         }
         if (error.status >= 500) {
-            return "Something went wrong on my end, try again in a minute";
+            return { text: "Something went wrong on my end, try again in a minute", aiSuggestions: [] };
         }
-        return "Oops, something went wrong. Try again?";
+        return { text: "Oops, something went wrong. Try again?", aiSuggestions: [] };
     }
 }

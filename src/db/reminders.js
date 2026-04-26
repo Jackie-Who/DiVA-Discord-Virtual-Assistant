@@ -192,6 +192,42 @@ export function markFired(id) {
 }
 
 /**
+ * Replace a reminder's message text. Used by the AI-suggested-title button so
+ * the user can swap their original title for an optimized version after creation.
+ *
+ * Ownership is enforced via the WHERE clause so we never accidentally edit
+ * another user's row. Returns true if a row was updated.
+ *
+ * For recurring rules, also updates any pending child instances so the next
+ * fire uses the new title too.
+ */
+export function updateReminderMessage(id, userId, newMessage) {
+    const db = getDb();
+    const row = getReminderById(id);
+    if (!row || row.user_id !== userId) return false;
+    if (row.fired_at || row.cancelled_at) return false;
+
+    const txn = db.transaction(() => {
+        db.prepare(`UPDATE reminders SET message = ? WHERE id = ? AND user_id = ?`)
+          .run(newMessage, id, userId);
+        // For recurring rules, propagate to any pending child instances
+        if (row.recurrence) {
+            const anchor = row.parent_id || row.id;
+            db.prepare(`
+                UPDATE reminders
+                SET message = ?
+                WHERE (id = ? OR parent_id = ?)
+                  AND user_id = ?
+                  AND fired_at IS NULL
+                  AND cancelled_at IS NULL
+            `).run(newMessage, anchor, anchor, userId);
+        }
+    });
+    txn();
+    return true;
+}
+
+/**
  * Fuzzy match for natural-language cancel/reschedule.
  * Searches active reminders for the user where `query` appears in message (case-insensitive).
  * Returns up to `limit` matches.

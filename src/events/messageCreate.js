@@ -1,6 +1,7 @@
 import { chat } from '../ai/chat.js';
 import { isRateLimited } from '../utils/rateLimiter.js';
 import { isGuildOutOfCredits, tryClaimOofNotice } from '../db/credits.js';
+import { attachAiSuggestionButtons } from '../utils/aiSuggestionButton.js';
 import logger from '../utils/logger.js';
 import { notifyError } from '../utils/errorNotifier.js';
 
@@ -60,15 +61,16 @@ export default function messageCreate(client) {
 
         try {
             await message.channel.sendTyping();
-            const response = await chat(message, client);
+            const { text: response, aiSuggestions = [] } = await chat(message, client);
 
             // Discord has a 2000 character limit per message
             // Split into as many messages as needed, max 6 to prevent spam
             const MAX_CHARS = 2000;
             const MAX_MESSAGES = 6;
 
+            let firstReply;
             if (response.length <= MAX_CHARS) {
-                await message.reply(response);
+                firstReply = await message.reply(response);
             } else {
                 const chunks = [];
                 let remaining = response;
@@ -106,10 +108,18 @@ export default function messageCreate(client) {
                 if (remaining.length > 0) {
                     chunks[chunks.length - 1] = chunks[chunks.length - 1].slice(0, MAX_CHARS - 30) + '\n\n*(response truncated)*';
                 }
-                await message.reply(chunks[0]);
+                firstReply = await message.reply(chunks[0]);
                 for (let i = 1; i < chunks.length; i++) {
                     await message.channel.send(chunks[i]);
                 }
+            }
+
+            // If a reminder tool produced an AI title suggestion, attach a
+            // "✨ Use suggested" button to the bot's first reply. Fire-and-forget
+            // — listener lives for 5 minutes; only the original user can click.
+            if (aiSuggestions.length > 0 && firstReply) {
+                attachAiSuggestionButtons(firstReply, aiSuggestions, message.author.id)
+                    .catch(err => logger.error('AI suggestion button error', { error: err.message }));
             }
         } catch (error) {
             logger.error('Message handler error', {

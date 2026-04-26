@@ -24,9 +24,14 @@ import {
     findActiveByQuery,
     getReminderById,
     getActiveRemindersForUser,
+    updateReminderMessage,
 } from '../db/reminders.js';
 import { scheduleNewReminder, cancelTimer, rescheduleTimer } from '../utils/reminderScheduler.js';
 import { setTimezone } from '../db/userSettings.js';
+import anthropic from './client.js';
+import { recordUsage } from '../db/tokenBudget.js';
+
+const SUGGESTION_MODEL = 'claude-haiku-4-5-20251001';
 
 const SHORT_REMINDER_THRESHOLD_MS = 24 * 60 * 60 * 1000; // 24h — short reminders auto-execute, no confirmation
 
@@ -366,9 +371,14 @@ async function doSetReminder(input, message, userId, settings) {
     // the user would see in /reminder list.
     const position = positionFor(userId, dbId);
 
+    // Fire-and-forget AI title optimization. If Haiku suggests something
+    // different, the chat layer attaches a "✨ Use suggested" button to the reply.
+    const suggested = await generateAiSuggestion(text, message.guild.id, userId);
+
     return {
         success: true,
         message: `Reminder #${position} set for ${discordTimestamp(utc, 'F')} (${discordTimestamp(utc, 'R')}). I'll ping you in this channel.`,
+        aiSuggestion: suggested ? { reminderId: dbId, originalTitle: text, suggestedTitle: suggested } : undefined,
     };
 }
 
@@ -420,9 +430,13 @@ async function doSetRecurring(input, message, userId, settings) {
     const when = input.recurrence === 'weekly'
         ? `every ${WEEKDAY_NAMES[weekday]} at ${input.fire_time_local}`
         : `every day at ${input.fire_time_local}`;
+
+    const suggested = await generateAiSuggestion(text, message.guild.id, userId);
+
     return {
         success: true,
         message: `Recurring reminder #${position} set: ${when} (${settings.timezone}). First fire: ${discordTimestamp(firstUtc, 'F')} (${discordTimestamp(firstUtc, 'R')}). Delivery: ${settings.deliveryMode === 'dm' ? 'DM' : 'channel'}.`,
+        aiSuggestion: suggested ? { reminderId: dbId, originalTitle: text, suggestedTitle: suggested } : undefined,
     };
 }
 
@@ -605,4 +619,76 @@ function positionFor(userId, dbId) {
     const active = getActiveRemindersForUser(userId);
     const idx = active.findIndex(r => r.id === dbId);
     return idx >= 0 ? idx + 1 : '?';
+}
+
+/**
+ * Ask Haiku to optimize a reminder title (e.g. "groceries" → "Grocery Shopping").
+ * Returns null if the suggestion is identical/whitespace-equivalent to the
+ * original (no point showing a swap button), or if the call fails.
+ *
+ * Cost is recorded against the originating guild via recordUsage().
+ */
+async function generateAiSuggestion(originalText, guildId, userId) {
+    const trimmed = originalText.trim();
+    if (!trimmed || trimmed.length > 200) return null;
+
+    try {
+        const response = await anthropic.messages.create({
+            model: SUGGESTION_MODEL,
+            max_tokens: 30,
+            messages: [{
+                role: 'user',
+                content: `You are optimizing a Discord reminder title. Convert the user's casual phrase into a clean, concise title (2-5 words, properly capitalized). Strip out time/date words ("tomorrow", "in 3 hours", "every morning") because the firing time is tracked separately. Keep the verb if there is one.
+
+Examples:
+"groceries" → Grocery Shopping
+"call mom" → Call Mom
+"do laundry tomorrow" → Do Laundry
+"test the bot in 3 hours" → Test the Bot
+"stretch every morning" → Morning Stretch
+"pick up dry cleaning" → Pick Up Dry Cleaning
+"meeting with sara" → Meeting with Sara
+
+If the original is already 2-5 polished words with proper capitalization, return it unchanged.
+
+Return ONLY the optimized title. No quotes, no explanation, no prefix.
+
+Original: ${trimmed}`,
+            }],
+        });
+
+        const raw = response.content[0]?.text || '';
+        const suggested = raw.trim()
+            .replace(/^["'`]+|["'`]+$/g, '')
+            .replace(/^(Optimized:|Title:|Suggestion:)\s*/i, '')
+            .trim();
+
+        if (response.usage) {
+            recordUsage(guildId, userId, response.usage.input_tokens, response.usage.output_tokens, SUGGESTION_MODEL);
+        }
+
+        if (!suggested) return null;
+        if (suggested.length > 100) return null; // sanity cap
+        if (suggested.toLowerCase() === trimmed.toLowerCase()) return null;
+        return suggested;
+    } catch (err) {
+        logger.warn('AI suggestion generation failed', { error: err.message });
+        return null;
+    }
+}
+
+/**
+ * Apply a previously-suggested title to a reminder. Called from the button
+ * handler in messageCreate.js. Validates ownership + still-active state.
+ */
+export async function applyAiSuggestion(reminderId, userId, newTitle) {
+    const trimmed = (newTitle || '').trim();
+    if (!trimmed || trimmed.length > 500) {
+        return { success: false, message: 'Suggested title is invalid.' };
+    }
+    const ok = updateReminderMessage(reminderId, userId, trimmed);
+    if (!ok) {
+        return { success: false, message: 'Could not update the reminder (already fired, cancelled, or not yours).' };
+    }
+    return { success: true, message: trimmed };
 }
