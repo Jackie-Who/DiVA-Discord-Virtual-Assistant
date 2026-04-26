@@ -1,12 +1,14 @@
 {
   "name": "diva",
-  "version": "1.0.0",
-  "description": "DiVA — Discord Virtual Assistant. A Claude-powered Discord bot with evolving personality, admin tools, and multi-model routing.",
+  "version": "1.2.0",
+  "description": "DiVA — Discord Virtual Assistant. A Claude-powered Discord bot with evolving personality, admin tools, multi-model routing, reminders, and secretary mode.",
+  "license": "MIT",
   "type": "module",
   "main": "src/index.js",
   "scripts": {
     "start": "node src/index.js",
-    "register": "node src/commands/register.js"
+    "register": "node src/commands/register.js",
+    "test": "node tests/budget.test.js && node tests/adminSanitization.test.js"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.39.0",

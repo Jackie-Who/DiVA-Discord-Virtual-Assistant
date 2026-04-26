@@ -1,7 +1,10 @@
 /**
- * Budget System Test Suite
+ * Per-Guild Credit System Test Suite (v1.2)
  *
- * Tests all budget functions using a temporary in-memory database.
+ * Tests the credit logic against an isolated in-memory database so we don't touch
+ * the real bot.db. The functions tested mirror src/db/credits.js and
+ * src/db/tokenBudget.js — when those change, this file must move in lockstep.
+ *
  * Zero API calls, zero token cost.
  *
  * Run: node tests/budget.test.js
@@ -9,7 +12,7 @@
 
 import Database from 'better-sqlite3';
 
-// ── Set up an isolated in-memory DB so we don't touch the real one ──
+// ── Set up an isolated in-memory DB ──
 
 const db = new Database(':memory:');
 db.pragma('journal_mode = WAL');
@@ -23,217 +26,273 @@ db.exec(`
         cost_usd REAL NOT NULL,
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP
     );
-    CREATE TABLE IF NOT EXISTS monthly_budget (
-        month_key TEXT PRIMARY KEY,
-        total_input_tokens INTEGER DEFAULT 0,
-        total_output_tokens INTEGER DEFAULT 0,
-        total_cost_usd REAL DEFAULT 0.0,
-        budget_limit_usd REAL NOT NULL
+    CREATE TABLE IF NOT EXISTS guild_credits (
+        guild_id TEXT PRIMARY KEY,
+        lifetime_credits_usd REAL NOT NULL DEFAULT 0.0,
+        total_spent_usd REAL NOT NULL DEFAULT 0.0,
+        owner_managed INTEGER NOT NULL DEFAULT 0,
+        last_topup_at DATETIME,
+        last_oof_notice_at DATETIME,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    );
+    CREATE TABLE IF NOT EXISTS credit_transactions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        guild_id TEXT NOT NULL,
+        kind TEXT NOT NULL CHECK(kind IN ('topup', 'refund', 'adjustment', 'migration')),
+        amount_usd REAL NOT NULL,
+        actor_user_id TEXT,
+        note TEXT,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
     );
 `);
 
-// ── Recreate budget functions against our test DB ──
+// ── Recreate credit functions inline against the in-memory DB ──
 
-const BUDGET_LIMIT = 20;
-const INPUT_COST_PER_MILLION = 3;
-const OUTPUT_COST_PER_MILLION = 15;
+const SAVING_MODE_PERCENT = 85;
+const OOF_COOLDOWN_MINUTES = 60 * 24;
 
-function getMonthKey() {
-    const now = new Date();
-    return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`;
-}
+const MODEL_PRICING = {
+    'claude-sonnet-4-6': { input: 3, output: 15 },
+    'claude-haiku-4-5-20251001': { input: 1, output: 5 },
+};
+const DEFAULT_PRICING = { input: 3, output: 15 };
 
-function recordUsage(guildId, userId, inputTokens, outputTokens) {
-    const costUsd = (inputTokens / 1_000_000 * INPUT_COST_PER_MILLION) +
-                    (outputTokens / 1_000_000 * OUTPUT_COST_PER_MILLION);
-    const monthKey = getMonthKey();
-
-    db.prepare(`INSERT INTO token_usage (guild_id, user_id, input_tokens, output_tokens, cost_usd) VALUES (?, ?, ?, ?, ?)`)
-      .run(guildId, userId, inputTokens, outputTokens, costUsd);
-
+function ensureRow(guildId) {
     db.prepare(`
-        INSERT INTO monthly_budget (month_key, total_input_tokens, total_output_tokens, total_cost_usd, budget_limit_usd)
-        VALUES (?, ?, ?, ?, ?)
-        ON CONFLICT(month_key) DO UPDATE SET
-            total_input_tokens = total_input_tokens + ?,
-            total_output_tokens = total_output_tokens + ?,
-            total_cost_usd = total_cost_usd + ?
-    `).run(monthKey, inputTokens, outputTokens, costUsd, BUDGET_LIMIT, inputTokens, outputTokens, costUsd);
+        INSERT OR IGNORE INTO guild_credits (guild_id, lifetime_credits_usd, total_spent_usd)
+        VALUES (?, 0.0, 0.0)
+    `).run(guildId);
 }
 
-function getCurrentMonthUsage() {
-    const row = db.prepare('SELECT * FROM monthly_budget WHERE month_key = ?').get(getMonthKey());
-    if (!row) return { inputTokens: 0, outputTokens: 0, costUsd: 0, budgetLimitUsd: BUDGET_LIMIT, remainingUsd: BUDGET_LIMIT };
+function topUp(guildId, amountUsd, actorUserId = '', note = '') {
+    if (!Number.isFinite(amountUsd) || amountUsd <= 0) {
+        throw new Error('topUp amount must be positive');
+    }
+    ensureRow(guildId);
+    const txn = db.transaction(() => {
+        db.prepare(`
+            UPDATE guild_credits
+            SET lifetime_credits_usd = lifetime_credits_usd + ?,
+                last_topup_at = CURRENT_TIMESTAMP
+            WHERE guild_id = ?
+        `).run(amountUsd, guildId);
+        db.prepare(`
+            INSERT INTO credit_transactions (guild_id, kind, amount_usd, actor_user_id, note)
+            VALUES (?, 'topup', ?, ?, ?)
+        `).run(guildId, amountUsd, actorUserId, note);
+    });
+    txn();
+}
+
+function recordUsage(guildId, userId, inputTokens, outputTokens, model) {
+    const pricing = MODEL_PRICING[model] || DEFAULT_PRICING;
+    const cost = (inputTokens / 1e6 * pricing.input) + (outputTokens / 1e6 * pricing.output);
+    db.prepare(`
+        INSERT INTO token_usage (guild_id, user_id, input_tokens, output_tokens, cost_usd)
+        VALUES (?, ?, ?, ?, ?)
+    `).run(guildId, userId, inputTokens, outputTokens, cost);
+    ensureRow(guildId);
+    db.prepare(`UPDATE guild_credits SET total_spent_usd = total_spent_usd + ? WHERE guild_id = ?`)
+      .run(cost, guildId);
+    return cost;
+}
+
+function getGuildCreditUsage(guildId) {
+    const row = db.prepare(`SELECT * FROM guild_credits WHERE guild_id = ?`).get(guildId);
+    if (!row) return { lifetimeCreditsUsd: 0, totalSpentUsd: 0, remainingUsd: 0, ownerManaged: false };
     return {
-        inputTokens: row.total_input_tokens,
-        outputTokens: row.total_output_tokens,
-        costUsd: row.total_cost_usd,
-        budgetLimitUsd: row.budget_limit_usd,
-        remainingUsd: Math.max(0, row.budget_limit_usd - row.total_cost_usd),
+        lifetimeCreditsUsd: row.lifetime_credits_usd,
+        totalSpentUsd: row.total_spent_usd,
+        remainingUsd: Math.max(0, row.lifetime_credits_usd - row.total_spent_usd),
+        ownerManaged: row.owner_managed === 1,
     };
 }
 
-function isBudgetExhausted() {
-    const u = getCurrentMonthUsage();
-    return u.costUsd >= u.budgetLimitUsd;
+function isGuildOutOfCredits(guildId) {
+    const u = getGuildCreditUsage(guildId);
+    if (u.ownerManaged) return false;
+    return u.totalSpentUsd >= u.lifetimeCreditsUsd;
 }
 
-function getBudgetPercent() {
-    const u = getCurrentMonthUsage();
-    if (u.budgetLimitUsd <= 0) return 100;
-    return (u.costUsd / u.budgetLimitUsd) * 100;
+function getGuildSpendPercent(guildId) {
+    const u = getGuildCreditUsage(guildId);
+    if (u.ownerManaged) return 0;
+    if (u.lifetimeCreditsUsd <= 0) return 100;
+    return (u.totalSpentUsd / u.lifetimeCreditsUsd) * 100;
 }
 
-function isInSavingMode() {
-    return getBudgetPercent() >= 85;
+function isGuildInSavingMode(guildId) {
+    return getGuildSpendPercent(guildId) >= SAVING_MODE_PERCENT;
+}
+
+function setOwnerManaged(guildId, flag) {
+    ensureRow(guildId);
+    db.prepare(`UPDATE guild_credits SET owner_managed = ? WHERE guild_id = ?`).run(flag ? 1 : 0, guildId);
+}
+
+function tryClaimOofNotice(guildId) {
+    const result = db.prepare(`
+        UPDATE guild_credits
+        SET last_oof_notice_at = CURRENT_TIMESTAMP
+        WHERE guild_id = ?
+          AND (last_oof_notice_at IS NULL OR last_oof_notice_at < datetime('now', ?))
+    `).run(guildId, `-${OOF_COOLDOWN_MINUTES} minutes`);
+    return result.changes > 0;
 }
 
 // ── Test runner ──
 
-let passed = 0;
-let failed = 0;
+let passed = 0, failed = 0;
 
-function assert(condition, testName) {
-    if (condition) {
-        passed++;
-        console.log(`  ✅ ${testName}`);
-    } else {
-        failed++;
-        console.log(`  ❌ ${testName}`);
-    }
+function assert(cond, name) {
+    if (cond) { passed++; console.log(`  ✅ ${name}`); }
+    else      { failed++; console.log(`  ❌ ${name}`); }
 }
 
-function assertClose(actual, expected, testName, tolerance = 0.0001) {
-    assert(Math.abs(actual - expected) < tolerance, `${testName} (got ${actual}, expected ${expected})`);
+function assertClose(actual, expected, name, tol = 1e-4) {
+    assert(Math.abs(actual - expected) < tol, `${name} (got ${actual}, expected ${expected})`);
 }
 
-// ── Tests ──
+console.log('\n🧪 Per-Guild Credit System Tests (v1.2)\n');
 
-console.log('\n🧪 Budget System Tests\n');
-
-// --- Test 1: Fresh month ---
-console.log('📋 Fresh month (no usage):');
+// --- Test 1: Fresh guild ---
+console.log('📋 Fresh guild (no row yet):');
 {
-    const usage = getCurrentMonthUsage();
-    assert(usage.inputTokens === 0, 'Input tokens = 0');
-    assert(usage.outputTokens === 0, 'Output tokens = 0');
-    assert(usage.costUsd === 0, 'Cost = $0');
-    assert(usage.remainingUsd === 20, 'Remaining = $20');
-    assert(usage.budgetLimitUsd === 20, 'Budget limit = $20');
-    assert(!isBudgetExhausted(), 'Budget NOT exhausted');
-    assert(!isInSavingMode(), 'Saving mode OFF');
-    assertClose(getBudgetPercent(), 0, 'Budget percent = 0%');
+    const u = getGuildCreditUsage('guild-fresh');
+    assertClose(u.lifetimeCreditsUsd, 0, 'lifetime = 0');
+    assertClose(u.totalSpentUsd, 0, 'spent = 0');
+    assertClose(u.remainingUsd, 0, 'remaining = 0');
+    assert(!u.ownerManaged, 'ownerManaged = false');
+    assert(isGuildOutOfCredits('guild-fresh'), 'OOF since 0 ≥ 0');
 }
 
-// --- Test 2: Single small usage ---
-console.log('\n📋 Single exchange (~average):');
+// --- Test 2: Top-up creates a balance ---
+console.log('\n📋 Top-up:');
 {
-    // Simulate a typical exchange: 800 input, 200 output
-    recordUsage('guild-1', 'user-1', 800, 200);
-    const usage = getCurrentMonthUsage();
-    const expectedCost = (800 / 1_000_000 * 3) + (200 / 1_000_000 * 15); // $0.0054
-    assertClose(usage.costUsd, expectedCost, `Cost = $${expectedCost.toFixed(6)}`);
-    assert(usage.inputTokens === 800, 'Input tokens = 800');
-    assert(usage.outputTokens === 200, 'Output tokens = 200');
-    assert(!isBudgetExhausted(), 'Budget NOT exhausted');
-    assert(!isInSavingMode(), 'Saving mode OFF');
-    assertClose(getBudgetPercent(), (expectedCost / 20) * 100, 'Budget percent correct');
+    topUp('guild-A', 5.00, 'owner-1', 'initial');
+    const u = getGuildCreditUsage('guild-A');
+    assertClose(u.lifetimeCreditsUsd, 5.00, 'lifetime = $5');
+    assertClose(u.totalSpentUsd, 0, 'spent = $0');
+    assertClose(u.remainingUsd, 5.00, 'remaining = $5');
+    assert(!isGuildOutOfCredits('guild-A'), 'NOT OOF after top-up');
+
+    const txns = db.prepare(`SELECT * FROM credit_transactions WHERE guild_id = 'guild-A'`).all();
+    assert(txns.length === 1, 'Audit row written');
+    assert(txns[0].kind === 'topup', 'kind = topup');
+    assertClose(txns[0].amount_usd, 5.00, 'amount = $5');
 }
 
-// --- Test 3: Accumulation across multiple guilds/users ---
-console.log('\n📋 Multiple guilds accumulate into same month:');
+// --- Test 3: Single Sonnet usage ---
+console.log('\n📋 Single Sonnet exchange (800 in, 200 out):');
 {
-    recordUsage('guild-1', 'user-2', 1000, 300);
-    recordUsage('guild-2', 'user-3', 500, 100);
-    const usage = getCurrentMonthUsage();
-    assert(usage.inputTokens === 800 + 1000 + 500, 'Input tokens accumulated correctly');
-    assert(usage.outputTokens === 200 + 300 + 100, 'Output tokens accumulated correctly');
+    const cost = recordUsage('guild-A', 'user-1', 800, 200, 'claude-sonnet-4-6');
+    const expected = (800 / 1e6 * 3) + (200 / 1e6 * 15); // $0.0054
+    assertClose(cost, expected, `Cost = $${expected.toFixed(6)}`);
+    const u = getGuildCreditUsage('guild-A');
+    assertClose(u.totalSpentUsd, expected, 'Spent updated');
+    assertClose(u.remainingUsd, 5.00 - expected, 'Remaining decreased correctly');
 }
 
-// --- Test 4: Token usage rows tracked per guild/user ---
-console.log('\n📋 Individual usage rows:');
+// --- Test 4: Haiku is cheaper ---
+console.log('\n📋 Haiku pricing (1/3 of Sonnet):');
 {
-    const rows = db.prepare('SELECT COUNT(*) as count FROM token_usage').get();
-    assert(rows.count === 3, 'Three individual usage rows recorded');
-
-    const guildRows = db.prepare("SELECT COUNT(*) as count FROM token_usage WHERE guild_id = 'guild-2'").get();
-    assert(guildRows.count === 1, 'Guild-2 has 1 row');
+    const sonnetCost = (1000 / 1e6 * 3) + (500 / 1e6 * 15);
+    const haikuCost  = (1000 / 1e6 * 1) + (500 / 1e6 * 5);
+    assertClose(sonnetCost, 0.0105, 'Sonnet 1k/500 = $0.0105');
+    assertClose(haikuCost, 0.0035, 'Haiku 1k/500 = $0.0035');
+    assert(haikuCost < sonnetCost, 'Haiku cheaper than Sonnet for same tokens');
 }
 
-// --- Test 5: Approach 85% threshold (saving mode) ---
+// --- Test 5: Per-guild isolation ---
+console.log('\n📋 Per-guild isolation:');
+{
+    topUp('guild-B', 10.00, 'owner-1', 'initial-B');
+    recordUsage('guild-B', 'user-2', 100, 100, 'claude-haiku-4-5-20251001');
+    const a = getGuildCreditUsage('guild-A');
+    const b = getGuildCreditUsage('guild-B');
+    assert(a.lifetimeCreditsUsd === 5.00, 'guild-A lifetime unchanged');
+    assert(b.lifetimeCreditsUsd === 10.00, 'guild-B lifetime separate');
+    assert(b.totalSpentUsd > 0 && b.totalSpentUsd < a.totalSpentUsd + 0.01, 'guild-B has its own spend');
+}
+
+// --- Test 6: Saving mode at 85% ---
 console.log('\n📋 Saving mode at 85%:');
 {
-    // Current cost is small. Need to reach 85% of $20 = $17.
-    // Record a big chunk: let's add enough to reach exactly 85%
-    const current = getCurrentMonthUsage();
-    const needed = (BUDGET_LIMIT * 0.85) - current.costUsd;
-    // Use output tokens (expensive at $15/M) to reach target efficiently
-    const outputTokensNeeded = Math.ceil((needed / 15) * 1_000_000);
-
-    recordUsage('guild-1', 'user-1', 0, outputTokensNeeded);
-
-    const pct = getBudgetPercent();
-    assert(pct >= 85, `Budget at ${pct.toFixed(1)}% (>= 85%)`);
-    assert(isInSavingMode(), 'Saving mode ON');
-    assert(!isBudgetExhausted(), 'Budget NOT yet exhausted');
+    // Top off guild-C to a known balance, then spend ~85% of it
+    topUp('guild-C', 1.00, 'owner-1', 'sm-test');
+    const target = 1.00 * 0.85;
+    const tokensNeeded = Math.ceil((target / 15) * 1e6);
+    recordUsage('guild-C', 'user-3', 0, tokensNeeded, 'claude-sonnet-4-6');
+    const pct = getGuildSpendPercent('guild-C');
+    assert(pct >= 85, `guild-C spend = ${pct.toFixed(1)}% (≥85)`);
+    assert(isGuildInSavingMode('guild-C'), 'Saving mode ON');
+    assert(!isGuildOutOfCredits('guild-C'), 'Not yet OOF (still some left)');
 }
 
-// --- Test 6: Hit 100% budget ---
-console.log('\n📋 Budget exhaustion at 100%:');
+// --- Test 7: Out of credits ---
+console.log('\n📋 Out of credits at 100%:');
 {
-    const current = getCurrentMonthUsage();
-    const needed = current.budgetLimitUsd - current.costUsd + 0.01;
-    const outputTokensNeeded = Math.ceil((needed / 15) * 1_000_000);
-
-    recordUsage('guild-1', 'user-1', 0, outputTokensNeeded);
-
-    assert(isBudgetExhausted(), 'Budget EXHAUSTED');
-    assert(isInSavingMode(), 'Saving mode still ON');
-    assert(getBudgetPercent() >= 100, `Budget at ${getBudgetPercent().toFixed(1)}%`);
-
-    const usage = getCurrentMonthUsage();
-    assert(usage.remainingUsd === 0, 'Remaining = $0');
+    // Drive guild-C to fully exhaust
+    const u = getGuildCreditUsage('guild-C');
+    const remaining = u.remainingUsd + 0.01;
+    const tokensNeeded = Math.ceil((remaining / 15) * 1e6);
+    recordUsage('guild-C', 'user-3', 0, tokensNeeded, 'claude-sonnet-4-6');
+    assert(isGuildOutOfCredits('guild-C'), 'guild-C is now OOF');
+    assert(getGuildCreditUsage('guild-C').remainingUsd === 0, 'remaining = $0');
 }
 
-// --- Test 7: Cost calculation precision ---
-console.log('\n📋 Cost calculation precision:');
+// --- Test 8: Owner-managed bypass ---
+console.log('\n📋 Owner-managed bypass:');
 {
-    // Verify exact cost formula
-    const inputTokens = 1_000_000;
-    const outputTokens = 1_000_000;
-    const expectedCost = (inputTokens / 1_000_000 * 3) + (outputTokens / 1_000_000 * 15);
-    assertClose(expectedCost, 18, 'Cost of 1M input + 1M output = $18');
-
-    // Small amounts
-    const smallCost = (100 / 1_000_000 * 3) + (50 / 1_000_000 * 15);
-    assertClose(smallCost, 0.001050, 'Cost of 100 input + 50 output = $0.00105');
+    setOwnerManaged('guild-C', true);
+    assert(!isGuildOutOfCredits('guild-C'), 'OOF check bypassed when owner_managed=1');
+    assertClose(getGuildSpendPercent('guild-C'), 0, 'Spend percent reports 0 when owner-managed');
+    assert(!isGuildInSavingMode('guild-C'), 'Saving mode OFF when owner-managed');
+    setOwnerManaged('guild-C', false);
+    assert(isGuildOutOfCredits('guild-C'), 'OOF returns once owner_managed cleared');
 }
 
-// --- Test 8: Month key format ---
-console.log('\n📋 Month key format:');
+// --- Test 9: OOF notice rate limit ---
+console.log('\n📋 OOF notice cooldown:');
 {
-    const key = getMonthKey();
-    assert(/^\d{4}-\d{2}$/.test(key), `Month key "${key}" matches YYYY-MM`);
-    const [year, month] = key.split('-').map(Number);
-    assert(year >= 2024 && year <= 2030, 'Year is reasonable');
-    assert(month >= 1 && month <= 12, 'Month 1-12');
+    const first = tryClaimOofNotice('guild-C');
+    assert(first === true, 'First claim succeeds');
+    const second = tryClaimOofNotice('guild-C');
+    assert(second === false, 'Second claim within cooldown returns false');
 }
 
-// --- Test 9: Different month isolation ---
-console.log('\n📋 Month isolation:');
+// --- Test 10: Top-up rejects bad input ---
+console.log('\n📋 Top-up validation:');
 {
-    // Manually insert a row for a different month
-    db.prepare(`
-        INSERT INTO monthly_budget (month_key, total_input_tokens, total_output_tokens, total_cost_usd, budget_limit_usd)
-        VALUES ('2025-01', 999999, 999999, 99.99, 20)
-    `).run();
+    let threw = false;
+    try { topUp('guild-D', 0); } catch { threw = true; }
+    assert(threw, 'Throws on amount=0');
+    threw = false;
+    try { topUp('guild-D', -5); } catch { threw = true; }
+    assert(threw, 'Throws on negative amount');
+    threw = false;
+    try { topUp('guild-D', NaN); } catch { threw = true; }
+    assert(threw, 'Throws on NaN');
+}
 
-    // Current month usage should NOT include the 2025-01 data
-    const usage = getCurrentMonthUsage();
-    assert(usage.costUsd < 25, 'Current month not polluted by other months');
+// --- Test 11: Cost formula precision ---
+console.log('\n📋 Cost formula precision:');
+{
+    const sonnet1M = (1e6 / 1e6 * 3) + (1e6 / 1e6 * 15);
+    assertClose(sonnet1M, 18, '1M/1M Sonnet = $18');
+    const haiku1M = (1e6 / 1e6 * 1) + (1e6 / 1e6 * 5);
+    assertClose(haiku1M, 6, '1M/1M Haiku = $6');
+    const small = (100 / 1e6 * 3) + (50 / 1e6 * 15);
+    assertClose(small, 0.00105, '100/50 Sonnet = $0.00105');
+}
 
-    const oldRow = db.prepare("SELECT * FROM monthly_budget WHERE month_key = '2025-01'").get();
-    assert(oldRow.total_cost_usd === 99.99, 'Old month data preserved separately');
+// --- Test 12: Token usage rows recorded per-guild ---
+console.log('\n📋 token_usage row count:');
+{
+    const guildARows = db.prepare(`SELECT COUNT(*) as count FROM token_usage WHERE guild_id = 'guild-A'`).get();
+    const guildBRows = db.prepare(`SELECT COUNT(*) as count FROM token_usage WHERE guild_id = 'guild-B'`).get();
+    assert(guildARows.count === 1, 'guild-A has 1 token_usage row');
+    assert(guildBRows.count === 1, 'guild-B has 1 token_usage row');
 }
 
 // ── Results ──
@@ -243,5 +302,4 @@ console.log(`Results: ${passed} passed, ${failed} failed, ${passed + failed} tot
 console.log(`${'─'.repeat(40)}\n`);
 
 db.close();
-
 process.exit(failed > 0 ? 1 : 0);

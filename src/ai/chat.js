@@ -2,9 +2,11 @@ import anthropic from './client.js';
 import { buildSystemPrompt } from './systemPrompt.js';
 import { saveMessage, getRecentHistory, getChannelMemory } from '../db/history.js';
 import { getPersonality, incrementInteractionCount, shouldRunDigest } from '../db/personality.js';
-import { isBudgetExhausted, isInSavingMode, getBudgetPercent, recordUsage } from '../db/tokenBudget.js';
+import { getUserSettings } from '../db/userSettings.js';
+import { isGuildOutOfCredits, isGuildInSavingMode, getGuildSpendPercent, recordUsage } from '../db/tokenBudget.js';
 import { runPersonalityDigest } from './personality.js';
 import { ADMIN_TOOL_DEFINITIONS, executeAdminTool, isReadOnlyTool, formatToolForConfirmation, recordUndoableAction, getUndoableActions, clearUndoActions, executeUndo } from './adminTools.js';
+import { USER_TOOL_DEFINITIONS, executeUserTool, isUserTool, isReadOnlyUserTool, formatUserToolForConfirmation, shouldSkipConfirmation } from './userTools.js';
 import config from '../config.js';
 import logger from '../utils/logger.js';
 import { PermissionsBitField, ActionRowBuilder, ButtonBuilder, ButtonStyle, ComponentType } from 'discord.js';
@@ -17,10 +19,9 @@ const ADMIN_MAX_TOKENS = 4096; // Higher token limit for admin tool requests to 
 // Model routing — Haiku for simple messages, Sonnet for complex
 const MODEL_SONNET = 'claude-sonnet-4-6';
 const MODEL_HAIKU = 'claude-haiku-4-5-20251001';
-const COMPLEX_INDICATORS = /\b(explain|analyze|compare|how does|why does|write|code|debug|review|create|help me|build|implement|summarize|describe|what happened|tell me about)\b/i;
+const COMPLEX_INDICATORS = /\b(explain|analyze|compare|how does|why does|write|code|debug|review|create|help me|build|implement|summarize|describe|what happened|tell me about|remind me|reminder|every day|every week|tomorrow|schedule)\b/i;
 const SIMPLE_MAX_LENGTH = 200; // Messages under this length with no complex indicators use Haiku
 
-const BUDGET_EXHAUSTED_MESSAGE = "I've used up my thinking budget for this month. I'll be back on the 1st! \u{1F4A4}";
 const SAVING_MODE_WARNING = "\n\n\u26A0\uFE0F *Budget is above 85% for the month — web search and image analysis are disabled to conserve tokens.*";
 const MAX_TOOL_ROUNDS = 3;
 
@@ -153,11 +154,17 @@ async function buildReplyChain(message, client, maxMessages = 3) {
 }
 
 /**
- * Send a confirmation message with buttons for admin tool actions.
+ * Send a confirmation message with buttons for admin OR user tool actions.
+ * Both go through the same UX. The formatter is dispatched per block based on
+ * whether the tool is an admin or user tool.
  * Returns { confirmed: boolean, confirmMsgId: string | null }
  */
-async function requestAdminConfirmation(message, toolBlocks) {
-    const actionLines = toolBlocks.map(b => formatToolForConfirmation(b.name, b.input));
+async function requestToolConfirmation(message, toolBlocks) {
+    const userId = message.author.id;
+    const actionLines = toolBlocks.map(b => {
+        if (isUserTool(b.name)) return formatUserToolForConfirmation(b.name, b.input, userId);
+        return formatToolForConfirmation(b.name, b.input);
+    });
     const description = actionLines.length === 1
         ? `I'll perform the following action:\n\n${actionLines[0]}`
         : `I'll perform the following **${actionLines.length} actions**:\n\n${actionLines.join('\n')}`;
@@ -290,20 +297,19 @@ export async function chat(message, client) {
     const guildName = message.guild.name;
     const memberIsAdmin = isAdmin(message.member);
 
-    if (isBudgetExhausted()) {
-        return BUDGET_EXHAUSTED_MESSAGE;
-    }
+    // Out-of-credits is handled in messageCreate.js (with the 24h notice cooldown).
+    // chat() is only called when the guild still has credits.
 
     let userContent = stripMentions(message.content);
 
-    // Inject budget percentage if the user asks about usage/budget/tokens
+    // Inject spend percentage if the user asks about usage/budget/tokens
     const budgetKeywords = /\b(usage|budget|token|limit|spending|cost|how much|remaining|left)\b/i;
     if (budgetKeywords.test(userContent)) {
-        const pct = getBudgetPercent().toFixed(1);
-        userContent += `\n\n[System: Current monthly budget usage is ${pct}% of total capacity.]`;
+        const pct = getGuildSpendPercent(guildId).toFixed(1);
+        userContent += `\n\n[System: This server has used ${pct}% of its credits.]`;
     }
 
-    const savingMode = isInSavingMode();
+    const savingMode = isGuildInSavingMode(guildId);
     const imageBlocks = savingMode ? [] : getImageAttachments(message);
 
     // Build reply chain context (includes images from chain)
@@ -320,9 +326,10 @@ export async function chat(message, client) {
     const hasAnyImages = allImages.length > 0 || message.attachments.size > 0 || replyChain.images.length > 0;
 
     if (!userContent && allImages.length === 0) {
-        return savingMode && hasAnyImages
+        const text = savingMode && hasAnyImages
             ? "I can see you shared an image, but image analysis is disabled right now to conserve my monthly budget." + SAVING_MODE_WARNING
             : "Hey! Did you mean to say something?";
+        return { text, aiSuggestions: [] };
     }
 
     const personalityPrompt = getPersonality(guildId);
@@ -335,7 +342,17 @@ export async function chat(message, client) {
         channelMemoryText = `\n\nRecent conversations in this channel:\n${lines.join('\n---\n')}\n\nUse this context if relevant, but don't reference it unprompted.`;
     }
 
-    const systemPromptText = buildSystemPrompt({ userName, guildName, personalityPrompt, isAdmin: memberIsAdmin }) + channelMemoryText;
+    // User context for the reminder tools (timezone + delivery prefs)
+    const userSettings = getUserSettings(userId);
+
+    const systemPromptText = buildSystemPrompt({
+        userName,
+        guildName,
+        personalityPrompt,
+        isAdmin: memberIsAdmin,
+        userTimezone: userSettings.timezone,
+        userHasDeliveryPrefs: !!userSettings.deliveryMode,
+    }) + channelMemoryText;
 
     const currentContent = buildUserContent(
         userContent || (allImages.length > 0 ? '(shared an image)' : ''),
@@ -358,6 +375,10 @@ export async function chat(message, client) {
         });
     }
 
+    // User tools (reminders) are available to EVERYONE.
+    tools.push(...USER_TOOL_DEFINITIONS);
+
+    // Admin tools layered on top for admins.
     if (memberIsAdmin) {
         tools.push(...ADMIN_TOOL_DEFINITIONS);
     }
@@ -399,40 +420,99 @@ export async function chat(message, client) {
         // Tool use loop — handle admin tool calls with confirmation
         let rounds = 0;
         const undoButtonPromises = []; // fire-and-forget undo listeners
+        // Cross-round safeguard: track signatures of writes that ALREADY SUCCEEDED
+        // this turn. In subsequent rounds, block writes whose signature matches one
+        // already executed (prevents Claude from re-firing the same action). Allow
+        // signatures NOT in the set so legitimate retries of FAILED writes (e.g.,
+        // after a validation error) can go through.
+        const executedWriteKeys = new Set();
+        // AI title suggestions yielded by reminder tool calls in this turn.
+        // Surfaced to messageCreate.js so it can attach a "✨ Use suggested" button
+        // to the bot's final reply.
+        const aiSuggestions = [];
+
+        // Build a stable signature for a write tool call so we can detect duplicates
+        // across rounds. Reminder-text-bearing tools key on (toolName, message); other
+        // tools key on a stringified input snapshot.
+        function writeKeyFor(toolName, input) {
+            if (input && typeof input.message === 'string') {
+                return `${toolName}::${input.message.trim().toLowerCase()}`;
+            }
+            return `${toolName}::${JSON.stringify(input).slice(0, 200)}`;
+        }
 
         while (response.stop_reason === 'tool_use' && rounds < MAX_TOOL_ROUNDS) {
             rounds++;
 
             const toolUseBlocks = response.content.filter(b => b.type === 'tool_use');
-            const adminToolBlocks = toolUseBlocks.filter(b => b.name !== 'web_search');
+            // Strip web_search (server-side, no executor needed) — keep everything else for our routing
+            const customBlocks = toolUseBlocks.filter(b => b.name !== 'web_search');
 
-            if (adminToolBlocks.length === 0) break;
+            // Per-round debug — tells us exactly what Claude tried to do each round
+            if (customBlocks.length > 0) {
+                logger.debug('Tool round', {
+                    round: rounds,
+                    user: userId,
+                    blocks: customBlocks.map(b => ({ name: b.name, input_preview: JSON.stringify(b.input).slice(0, 200) })),
+                    executedWriteKeys: [...executedWriteKeys],
+                });
+            }
 
-            // Check admin rate limit before executing any tools
-            const rateCheck = checkAdminRateLimit(guildId);
-            if (!rateCheck.allowed) {
-                const retrySeconds = Math.ceil(rateCheck.retryAfterMs / 1000);
-                // Return rate limit as tool results so Claude can inform the user
-                for (const toolUse of adminToolBlocks) {
-                    messages.push({ role: 'assistant', content: response.content });
-                    messages.push({ role: 'user', content: [{
-                        type: 'tool_result',
-                        tool_use_id: toolUse.id,
-                        content: `Rate limited — too many admin actions. Try again in ${retrySeconds} seconds.`,
-                        is_error: true,
-                    }] });
-                }
+            if (customBlocks.length === 0) break;
+
+            // Split by tool category
+            const adminBlocks = customBlocks.filter(b => !isUserTool(b.name));
+            const userBlocks = customBlocks.filter(b => isUserTool(b.name));
+
+            // If a non-admin somehow triggered an admin tool block, refuse politely
+            if (adminBlocks.length > 0 && !memberIsAdmin) {
+                messages.push({ role: 'assistant', content: response.content });
+                messages.push({ role: 'user', content: adminBlocks.map(b => ({
+                    type: 'tool_result',
+                    tool_use_id: b.id,
+                    content: 'That action requires server admin permissions. The user is not an admin.',
+                    is_error: true,
+                })).concat(userBlocks.map(b => ({
+                    type: 'tool_result',
+                    tool_use_id: b.id,
+                    content: 'Skipped — combined call had admin tools the user cannot use.',
+                    is_error: true,
+                }))) });
                 break;
             }
 
-            // Separate read-only tools (no confirmation needed) from write tools
-            const readOnlyBlocks = adminToolBlocks.filter(b => isReadOnlyTool(b.name));
-            const writeBlocks = adminToolBlocks.filter(b => !isReadOnlyTool(b.name));
+            // Apply admin rate limit only when admin tools were called
+            if (adminBlocks.length > 0) {
+                const rateCheck = checkAdminRateLimit(guildId);
+                if (!rateCheck.allowed) {
+                    const retrySeconds = Math.ceil(rateCheck.retryAfterMs / 1000);
+                    messages.push({ role: 'assistant', content: response.content });
+                    messages.push({ role: 'user', content: customBlocks.map(b => ({
+                        type: 'tool_result',
+                        tool_use_id: b.id,
+                        content: `Rate limited — too many admin actions. Try again in ${retrySeconds} seconds.`,
+                        is_error: true,
+                    })) });
+                    break;
+                }
+            }
 
+            // Separate read-only from write across both categories.
+            // User tools have a third bucket: "auto-execute" (e.g., set_timezone,
+            // short one-shot reminders <24h away) which run without a confirmation card.
+            const adminReadOnly = adminBlocks.filter(b => isReadOnlyTool(b.name));
+            const adminWrite = adminBlocks.filter(b => !isReadOnlyTool(b.name));
+
+            const userReadOnly = userBlocks.filter(b => isReadOnlyUserTool(b.name));
+            const userWriteAll = userBlocks.filter(b => !isReadOnlyUserTool(b.name));
+            const userAutoExec = userWriteAll.filter(b => shouldSkipConfirmation(b.name, b.input, userId));
+            const userWrite = userWriteAll.filter(b => !shouldSkipConfirmation(b.name, b.input, userId));
+
+            const writeBlocks = [...adminWrite, ...userWrite];
             const toolResults = [];
 
-            // Execute read-only tools immediately (list_channels, list_roles)
-            for (const toolUse of readOnlyBlocks) {
+            // Execute read-only tools immediately (always safe, never blocked)
+            for (const toolUse of adminReadOnly) {
                 const result = await executeAdminTool(toolUse.name, toolUse.input, message.guild, userId);
                 toolResults.push({
                     type: 'tool_result',
@@ -441,52 +521,119 @@ export async function chat(message, client) {
                 });
                 recordAdminToolCall(guildId);
             }
+            for (const toolUse of userReadOnly) {
+                const result = await executeUserTool(toolUse.name, toolUse.input, message, userId);
+                toolResults.push({
+                    type: 'tool_result',
+                    tool_use_id: toolUse.id,
+                    content: result.message,
+                });
+            }
 
-            // Write tools need confirmation
-            if (writeBlocks.length > 0) {
-                const { confirmed, confirmMsgId, confirmMsg: cMsg, description } = await requestAdminConfirmation(message, writeBlocks);
+            // Cross-round safeguard (per-write): block ONLY writes whose signature
+            // matches a write that already SUCCEEDED earlier this turn. New writes
+            // (different message/input) and retries of FAILED writes go through.
+            const blockedDuplicates = [];
 
-                if (confirmed) {
-                    let hasUndoableActions = false;
-
-                    for (const toolUse of writeBlocks) {
-                        const result = await executeAdminTool(toolUse.name, toolUse.input, message.guild, userId);
-                        toolResults.push({
-                            type: 'tool_result',
-                            tool_use_id: toolUse.id,
-                            content: result.message,
-                        });
-                        recordAdminToolCall(guildId);
-
-                        // Record undo metadata
-                        if (result.undo) {
-                            recordUndoableAction(guildId, userId, confirmMsgId, result.undo);
-                            hasUndoableActions = true;
-                        }
-                        if (result.undoMulti) {
-                            for (const u of result.undoMulti) {
-                                recordUndoableAction(guildId, userId, confirmMsgId, u);
-                            }
-                            hasUndoableActions = true;
-                        }
-                    }
-
-                    // Attach undo button (fire-and-forget, don't block the response)
-                    if (hasUndoableActions && cMsg) {
-                        undoButtonPromises.push(
-                            attachUndoButton(cMsg, description, guildId, userId, confirmMsgId, message.guild)
-                                .catch(err => logger.error('Undo button error', { error: err.message }))
-                        );
-                    }
-                } else {
-                    for (const toolUse of writeBlocks) {
-                        toolResults.push({
-                            type: 'tool_result',
-                            tool_use_id: toolUse.id,
-                            content: 'Action cancelled by user.',
-                        });
-                    }
+            const allowedAutoExec = userAutoExec.filter(b => {
+                if (executedWriteKeys.has(writeKeyFor(b.name, b.input))) {
+                    blockedDuplicates.push(b);
+                    return false;
                 }
+                return true;
+            });
+            const allowedWriteBlocks = writeBlocks.filter(b => {
+                if (executedWriteKeys.has(writeKeyFor(b.name, b.input))) {
+                    blockedDuplicates.push(b);
+                    return false;
+                }
+                return true;
+            });
+
+            for (const toolUse of blockedDuplicates) {
+                logger.warn('Blocked duplicate write tool', { user: userId, name: toolUse.name });
+                toolResults.push({
+                    type: 'tool_result',
+                    tool_use_id: toolUse.id,
+                    content: 'This action was already completed earlier this turn. Respond to the user with text instead of repeating it.',
+                    is_error: true,
+                });
+            }
+
+            {
+                // Auto-execute user-write tools that don't need confirmation (set_timezone, short reminders)
+                for (const toolUse of allowedAutoExec) {
+                    const result = await executeUserTool(toolUse.name, toolUse.input, message, userId);
+                    toolResults.push({
+                        type: 'tool_result',
+                        tool_use_id: toolUse.id,
+                        content: result.message,
+                    });
+                    if (result.aiSuggestion) aiSuggestions.push(result.aiSuggestion);
+                    // Only track signatures of SUCCEEDED writes — failed ones can be legitimately retried
+                    if (result.success) executedWriteKeys.add(writeKeyFor(toolUse.name, toolUse.input));
+                }
+
+                // Write tools need confirmation (single combined card if mixed admin + user)
+                if (allowedWriteBlocks.length > 0) {
+                    const { confirmed, confirmMsgId, confirmMsg: cMsg, description } = await requestToolConfirmation(message, allowedWriteBlocks);
+
+                    if (confirmed) {
+                        let hasUndoableActions = false;
+
+                        for (const toolUse of allowedWriteBlocks) {
+                            let result;
+                            if (isUserTool(toolUse.name)) {
+                                result = await executeUserTool(toolUse.name, toolUse.input, message, userId);
+                                if (result.aiSuggestion) aiSuggestions.push(result.aiSuggestion);
+                            } else {
+                                result = await executeAdminTool(toolUse.name, toolUse.input, message.guild, userId);
+                                recordAdminToolCall(guildId);
+
+                                // Only admin tools have undo metadata
+                                if (result.undo) {
+                                    recordUndoableAction(guildId, userId, confirmMsgId, result.undo);
+                                    hasUndoableActions = true;
+                                }
+                                if (result.undoMulti) {
+                                    for (const u of result.undoMulti) {
+                                        recordUndoableAction(guildId, userId, confirmMsgId, u);
+                                    }
+                                    hasUndoableActions = true;
+                                }
+                            }
+
+                            toolResults.push({
+                                type: 'tool_result',
+                                tool_use_id: toolUse.id,
+                                content: result.message,
+                            });
+
+                            // Track signature only on success — failed writes can be retried
+                            if (result.success) executedWriteKeys.add(writeKeyFor(toolUse.name, toolUse.input));
+                        }
+
+                        // Attach undo button (fire-and-forget) — only for admin actions
+                        if (hasUndoableActions && cMsg) {
+                            undoButtonPromises.push(
+                                attachUndoButton(cMsg, description, guildId, userId, confirmMsgId, message.guild)
+                                    .catch(err => logger.error('Undo button error', { error: err.message }))
+                            );
+                        }
+                    } else {
+                        // User cancelled or timed out. Push tool_results so Claude can wrap up
+                        // with text. Track signatures of cancelled writes so Claude doesn't
+                        // immediately retry the same one (treats cancel like "completed" for safeguard).
+                        for (const toolUse of allowedWriteBlocks) {
+                            toolResults.push({
+                                type: 'tool_result',
+                                tool_use_id: toolUse.id,
+                                content: 'The user did not confirm this action. Acknowledge briefly in text — do NOT call this tool again with similar input.',
+                            });
+                            executedWriteKeys.add(writeKeyFor(toolUse.name, toolUse.input));
+                        }
+                    }
+                } // close: if (allowedWriteBlocks.length > 0) — confirmation flow
             }
 
             if (toolResults.length === 0) break;
@@ -537,7 +684,7 @@ export async function chat(message, client) {
             isAdmin: memberIsAdmin,
         });
 
-        return responseText;
+        return { text: responseText, aiSuggestions };
     } catch (error) {
         logger.error('Anthropic API error', {
             guild: guildId,
@@ -550,15 +697,16 @@ export async function chat(message, client) {
         await notifyError({
             title: 'Anthropic API Error',
             error,
+            guildId,
             context: { guild: guildId, channel: channelId, user: userId, status: error.status },
         });
 
         if (error.status === 429) {
-            return "I need a quick breather, try again in a sec \u{1F605}";
+            return { text: "I need a quick breather, try again in a sec \u{1F605}", aiSuggestions: [] };
         }
         if (error.status >= 500) {
-            return "Something went wrong on my end, try again in a minute";
+            return { text: "Something went wrong on my end, try again in a minute", aiSuggestions: [] };
         }
-        return "Oops, something went wrong. Try again?";
+        return { text: "Oops, something went wrong. Try again?", aiSuggestions: [] };
     }
 }

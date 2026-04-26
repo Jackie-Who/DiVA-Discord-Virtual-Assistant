@@ -1,8 +1,13 @@
 node_modules/
 .env
+.env.local
+.env.*.local
 bot.db
 bot.db-shm
 bot.db-wal
+bot.dev.db
+bot.dev.db-shm
+bot.dev.db-wal
 logs/
 backups/
 bot.pid

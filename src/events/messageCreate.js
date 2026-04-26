@@ -1,6 +1,7 @@
 import { chat } from '../ai/chat.js';
 import { isRateLimited } from '../utils/rateLimiter.js';
-import { isBudgetExhausted } from '../db/tokenBudget.js';
+import { isGuildOutOfCredits, tryClaimOofNotice } from '../db/credits.js';
+import { attachAiSuggestionButtons } from '../utils/aiSuggestionButton.js';
 import logger from '../utils/logger.js';
 import { notifyError } from '../utils/errorNotifier.js';
 
@@ -38,27 +39,38 @@ export default function messageCreate(client) {
             return;
         }
 
-        // Budget check
-        if (isBudgetExhausted()) {
-            try {
-                await message.reply("I've used up my thinking budget for this month. I'll be back on the 1st! \u{1F4A4}");
-            } catch (error) {
-                logger.error('Failed to send budget message', { error: error.message });
+        // Out-of-credits check (per-server lifetime credits, owner-managed guilds bypass)
+        if (isGuildOutOfCredits(message.guild.id)) {
+            // Post the OOF notice at most once per 24h per guild — don't spam.
+            const shouldNotify = tryClaimOofNotice(message.guild.id);
+            if (shouldNotify) {
+                try {
+                    await message.reply(
+                        "💤 This server is out of credits. An admin can top up with `/credits` (or contact the bot owner). " +
+                        "I'll be back as soon as credits are added!"
+                    );
+                } catch (error) {
+                    logger.error('Failed to send out-of-credits message', { error: error.message });
+                }
+            } else {
+                // Silent acknowledge so the user knows we saw it but won't reply.
+                try { await message.react('\u{1F4A4}'); } catch { /* missing perms */ }
             }
             return;
         }
 
         try {
             await message.channel.sendTyping();
-            const response = await chat(message, client);
+            const { text: response, aiSuggestions = [] } = await chat(message, client);
 
             // Discord has a 2000 character limit per message
             // Split into as many messages as needed, max 6 to prevent spam
             const MAX_CHARS = 2000;
             const MAX_MESSAGES = 6;
 
+            let firstReply;
             if (response.length <= MAX_CHARS) {
-                await message.reply(response);
+                firstReply = await message.reply(response);
             } else {
                 const chunks = [];
                 let remaining = response;
@@ -96,10 +108,18 @@ export default function messageCreate(client) {
                 if (remaining.length > 0) {
                     chunks[chunks.length - 1] = chunks[chunks.length - 1].slice(0, MAX_CHARS - 30) + '\n\n*(response truncated)*';
                 }
-                await message.reply(chunks[0]);
+                firstReply = await message.reply(chunks[0]);
                 for (let i = 1; i < chunks.length; i++) {
                     await message.channel.send(chunks[i]);
                 }
+            }
+
+            // If a reminder tool produced an AI title suggestion, attach a
+            // "✨ Use suggested" button to the bot's first reply. Fire-and-forget
+            // — listener lives for 5 minutes; only the original user can click.
+            if (aiSuggestions.length > 0 && firstReply) {
+                attachAiSuggestionButtons(firstReply, aiSuggestions, message.author.id)
+                    .catch(err => logger.error('AI suggestion button error', { error: err.message }));
             }
         } catch (error) {
             logger.error('Message handler error', {
@@ -113,6 +133,7 @@ export default function messageCreate(client) {
             await notifyError({
                 title: 'Message Handler Error',
                 error,
+                guildId: message.guild?.id,
                 context: {
                     guild: message.guild?.id,
                     channel: message.channel.id,

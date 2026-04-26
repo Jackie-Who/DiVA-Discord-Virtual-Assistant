@@ -1,19 +1,28 @@
 import logger from '../utils/logger.js';
-import createChannel from '../commands/createChannel.js';
-import deleteChannel from '../commands/deleteChannel.js';
-import ban from '../commands/ban.js';
-import kick from '../commands/kick.js';
-import purge from '../commands/purge.js';
 import budget from '../commands/budget.js';
+import credits from '../commands/credits.js';
+import channel from '../commands/channels.js';
+import notices from '../commands/notices.js';
+import timezone from '../commands/timezone.js';
+import reminder from '../commands/reminder.js';
+import secretary from '../commands/secretary.js';
 import personality from '../commands/personality.js';
 
+// Note: as of v1.2 we removed /create-channel, /delete-channel, /ban, /kick, /purge —
+// Discord's native UI handles those better, and the bot's natural-language admin
+// tools cover the same actions when needed.
+//
+// New v1.2 commands (credits, timezone, reminder, secretary, channel, notices) are
+// registered in register.js and added to the dispatch table below as each one ships.
+
 const commands = {
-    'create-channel': createChannel,
-    'delete-channel': deleteChannel,
-    ban,
-    kick,
-    purge,
     budget,
+    credits,
+    channel,
+    notices,
+    timezone,
+    reminder,
+    secretary,
     personality,
 };
 

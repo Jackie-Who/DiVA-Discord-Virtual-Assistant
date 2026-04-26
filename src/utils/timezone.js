@@ -1,0 +1,164 @@
+/**
+ * Timezone helpers (no external deps — uses Node's built-in Intl + Date).
+ *
+ * The tricky problem: given a local-time string like "2026-04-26 09:00" in
+ * IANA zone "America/Los_Angeles", what is the UTC instant?
+ *
+ * Approach: round-trip via Intl.DateTimeFormat to discover the offset for
+ * that local time in that zone, then subtract the offset.
+ */
+
+/**
+ * Validate an IANA timezone string.
+ */
+export function isValidIANAZone(zone) {
+    if (typeof zone !== 'string' || !zone) return false;
+    try {
+        new Intl.DateTimeFormat('en-US', { timeZone: zone }).format(new Date());
+        return true;
+    } catch {
+        return false;
+    }
+}
+
+/**
+ * Parse "YYYY-MM-DD HH:MM" (or "YYYY-MM-DDTHH:MM") in `zone` and return
+ * a Date representing the UTC instant.
+ *
+ * Throws on malformed input.
+ */
+export function localToUtc(localStr, zone) {
+    if (!isValidIANAZone(zone)) {
+        throw new Error(`Invalid timezone: ${zone}`);
+    }
+    const m = /^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2})(?::(\d{2}))?$/.exec(localStr.trim());
+    if (!m) throw new Error(`Local time must be "YYYY-MM-DD HH:MM" (got "${localStr}")`);
+
+    const [, year, month, day, hour, minute, second] = m.map(Number);
+
+    // Step 1: assume UTC, build the date
+    const fakeUtc = new Date(Date.UTC(year, month - 1, day, hour, minute, second || 0));
+
+    // Step 2: project this UTC instant into the target zone — read the wall clock
+    const fmt = new Intl.DateTimeFormat('en-CA', {
+        timeZone: zone,
+        year: 'numeric', month: '2-digit', day: '2-digit',
+        hour: '2-digit', minute: '2-digit', second: '2-digit',
+        hour12: false,
+    });
+    const parts = fmt.formatToParts(fakeUtc);
+    const get = (t) => parseInt(parts.find(p => p.type === t).value, 10);
+
+    // The wall clock in the zone reads tzWall; we wanted it to read (year, month, ...).
+    // The difference (in ms) between what we got and what we wanted is the zone offset.
+    const tzWallAsUtc = Date.UTC(get('year'), get('month') - 1, get('day'),
+                                  get('hour') === 24 ? 0 : get('hour'),
+                                  get('minute'), get('second'));
+    const offsetMs = tzWallAsUtc - fakeUtc.getTime();
+
+    // Step 3: actual UTC instant = fake UTC - offset
+    return new Date(fakeUtc.getTime() - offsetMs);
+}
+
+/**
+ * Format a Date as a SQLite-friendly UTC string: "YYYY-MM-DD HH:MM:SS".
+ * (SQLite's datetime() uses this format — matches stored fire_at_utc values.)
+ *
+ * IMPORTANT: this format does NOT include a timezone marker ("Z"). When you
+ * read these values back into JavaScript, use `parseSqliteUtc()` below, NOT
+ * `new Date(str)` — JS would parse the bare format as LOCAL time, not UTC.
+ */
+export function toSqliteUtc(date) {
+    return date.toISOString().replace('T', ' ').replace(/\.\d{3}Z$/, '');
+}
+
+/**
+ * Parse a SQLite-stored UTC datetime string back into a JS Date.
+ * Use this for any column that was written with `toSqliteUtc()` — fire_at_utc,
+ * fired_at, cancelled_at, etc.
+ *
+ * Accepts either "YYYY-MM-DD HH:MM:SS" or "YYYY-MM-DDTHH:MM:SS". Always treats
+ * the string as UTC, regardless of the host machine's local timezone.
+ */
+export function parseSqliteUtc(str) {
+    if (!str) return null;
+    if (str instanceof Date) return str;
+    const m = /^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2})(?::(\d{2}))?(?:\.\d+)?Z?$/.exec(str.trim());
+    if (!m) return new Date(str); // last-ditch fallback
+    return new Date(Date.UTC(
+        parseInt(m[1], 10),
+        parseInt(m[2], 10) - 1,
+        parseInt(m[3], 10),
+        parseInt(m[4], 10),
+        parseInt(m[5], 10),
+        m[6] ? parseInt(m[6], 10) : 0,
+    ));
+}
+
+/**
+ * Format a UTC Date as a human-readable string in the given zone.
+ * e.g. "Sun, Apr 26, 9:00 AM PDT"
+ *
+ * Use this only for log lines, owner-facing /budget output, etc. For anything
+ * shown to end users in Discord, prefer `discordTimestamp()` below — Discord
+ * renders that natively in the viewer's locale and zone.
+ */
+export function formatLocal(date, zone, opts = {}) {
+    return new Intl.DateTimeFormat('en-US', {
+        timeZone: zone,
+        weekday: 'short',
+        month: 'short',
+        day: 'numeric',
+        hour: 'numeric',
+        minute: '2-digit',
+        hour12: true,
+        timeZoneName: 'short',
+        ...opts,
+    }).format(date);
+}
+
+/**
+ * Discord's auto-localized timestamp markdown. Discord renders <t:UNIX:F>
+ * in each viewer's own locale and timezone — no need for us to compute it.
+ *
+ * Formats:
+ *   t  → "9:00 AM"             (short time)
+ *   T  → "9:00:00 AM"          (long time)
+ *   d  → "04/26/2026"          (short date)
+ *   D  → "April 26, 2026"      (long date)
+ *   f  → "April 26, 2026 9:00 AM"          (short date+time, default)
+ *   F  → "Sunday, April 26, 2026 9:00 AM"  (long date+time, weekday)
+ *   R  → "in 2 hours" / "5 minutes ago"     (relative)
+ *
+ * @param {Date|number|string} date  Date object, ms timestamp, or ISO string
+ * @param {string} format  one of t T d D f F R (default: F)
+ */
+export function discordTimestamp(date, format = 'F') {
+    const d = date instanceof Date ? date : new Date(date);
+    const unix = Math.floor(d.getTime() / 1000);
+    return `<t:${unix}:${format}>`;
+}
+
+/**
+ * "Now" in a given IANA zone, returned as { year, month, day, hour, minute, weekday }.
+ * Useful for the system prompt + scheduler.
+ */
+export function nowInZone(zone) {
+    if (!isValidIANAZone(zone)) zone = 'UTC';
+    const fmt = new Intl.DateTimeFormat('en-CA', {
+        timeZone: zone,
+        year: 'numeric', month: '2-digit', day: '2-digit',
+        hour: '2-digit', minute: '2-digit', weekday: 'short', hour12: false,
+    });
+    const parts = fmt.formatToParts(new Date());
+    const get = (t) => parts.find(p => p.type === t)?.value;
+    const weekdayMap = { Sun: 0, Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6 };
+    return {
+        year: parseInt(get('year'), 10),
+        month: parseInt(get('month'), 10),
+        day: parseInt(get('day'), 10),
+        hour: parseInt(get('hour'), 10),
+        minute: parseInt(get('minute'), 10),
+        weekday: weekdayMap[get('weekday')] ?? 0,
+    };
+}
