@@ -54,7 +54,7 @@ export const USER_TOOL_DEFINITIONS = [
     },
     {
         name: 'set_reminder',
-        description: 'Schedule a one-shot reminder for the current user. Pass EITHER seconds_from_now (for reminders under 1 hour from now — preferred for precision) OR fire_at_local (for reminders 1 hour or more away). NEVER pass both.',
+        description: 'Schedule a one-shot reminder for the current user. Pass EITHER seconds_from_now OR fire_at_local — NEVER both. Choose based on duration: under 1 hour → seconds_from_now; 1 hour or longer → fire_at_local. The 1-hour boundary is HARD — do not put 7200 (2 hours) in seconds_from_now, that will be REJECTED. For "in 2 hours", "in 3 hours", "tomorrow", etc., always use fire_at_local.',
         input_schema: {
             type: 'object',
             properties: {
@@ -64,13 +64,13 @@ export const USER_TOOL_DEFINITIONS = [
                 },
                 seconds_from_now: {
                     type: 'integer',
-                    description: 'Exact seconds from now until the reminder fires. PREFER THIS for any reminder under 1 hour out — minute-rounded local time strings drift by up to 60 seconds and feel wrong when the user said "in 1 minute". Examples: "in 30 seconds" → 30, "in 1 minute" → 60, "in 5 minutes" → 300, "in half an hour" → 1800, "in 45 minutes" → 2700. Min 5, max 3600 (1 hour).',
+                    description: 'Exact seconds from now until the reminder fires. ONLY use for reminders STRICTLY UNDER 1 HOUR (3600 seconds). Examples: "in 30 seconds" → 30, "in 1 minute" → 60, "in 5 minutes" → 300, "in half an hour" → 1800, "in 45 minutes" → 2700, "in 59 minutes" → 3540. For ANYTHING 1 hour or longer ("in 1 hour", "in 2 hours", "in 3 hours", "tomorrow", etc.), DO NOT pass this — use fire_at_local instead. Min 5, max 3600.',
                     minimum: 5,
                     maximum: 3600,
                 },
                 fire_at_local: {
                     type: 'string',
-                    description: 'When to fire, in the USER\'S local timezone, formatted "YYYY-MM-DD HH:MM" (24-hour). Use this ONLY for reminders 1 hour or more from now ("tomorrow at 9am", "in 3 hours", "next Monday morning"). For shorter reminders use seconds_from_now instead. The user MUST have set their timezone first.',
+                    description: 'When to fire, in the USER\'S local timezone, formatted "YYYY-MM-DD HH:MM" (24-hour). REQUIRED for ANY reminder 1 hour or more from now: "in 1 hour", "in 2 hours", "in 3 hours", "tomorrow at 9am", "next Monday morning", "in 3 days", etc. Compute by adding the duration to the user\'s current local time given in the system prompt. The user MUST have set their timezone first.',
                 },
             },
             required: ['message'],

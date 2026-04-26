@@ -420,22 +420,29 @@ export async function chat(message, client) {
         // Tool use loop — handle admin tool calls with confirmation
         let rounds = 0;
         const undoButtonPromises = []; // fire-and-forget undo listeners
-        // Cross-round safeguard: once a write fires (or cancels), reject writes in
-        // SUBSEQUENT rounds. This prevents Claude from re-calling the same tool
-        // after seeing a success result. Within a single round, all writes are
-        // allowed — Claude is allowed to plan multiple tools in one response.
-        let writesInPreviousRounds = false;
+        // Cross-round safeguard: track signatures of writes that ALREADY SUCCEEDED
+        // this turn. In subsequent rounds, block writes whose signature matches one
+        // already executed (prevents Claude from re-firing the same action). Allow
+        // signatures NOT in the set so legitimate retries of FAILED writes (e.g.,
+        // after a validation error) can go through.
+        const executedWriteKeys = new Set();
         // AI title suggestions yielded by reminder tool calls in this turn.
         // Surfaced to messageCreate.js so it can attach a "✨ Use suggested" button
         // to the bot's final reply.
         const aiSuggestions = [];
 
+        // Build a stable signature for a write tool call so we can detect duplicates
+        // across rounds. Reminder-text-bearing tools key on (toolName, message); other
+        // tools key on a stringified input snapshot.
+        function writeKeyFor(toolName, input) {
+            if (input && typeof input.message === 'string') {
+                return `${toolName}::${input.message.trim().toLowerCase()}`;
+            }
+            return `${toolName}::${JSON.stringify(input).slice(0, 200)}`;
+        }
+
         while (response.stop_reason === 'tool_use' && rounds < MAX_TOOL_ROUNDS) {
             rounds++;
-            // Snapshot at start of round — within this round we only consult this
-            // immutable value. We update writesInPreviousRounds at the END of the
-            // round if any writes happened, so it only affects FUTURE rounds.
-            const blockWritesThisRound = writesInPreviousRounds;
 
             const toolUseBlocks = response.content.filter(b => b.type === 'tool_use');
             // Strip web_search (server-side, no executor needed) — keep everything else for our routing
@@ -447,7 +454,7 @@ export async function chat(message, client) {
                     round: rounds,
                     user: userId,
                     blocks: customBlocks.map(b => ({ name: b.name, input_preview: JSON.stringify(b.input).slice(0, 200) })),
-                    blockWritesThisRound,
+                    executedWriteKeys: [...executedWriteKeys],
                 });
             }
 
@@ -503,8 +510,6 @@ export async function chat(message, client) {
 
             const writeBlocks = [...adminWrite, ...userWrite];
             const toolResults = [];
-            // Track whether THIS round actually wrote anything — drives the cross-round flag below.
-            let didWriteThisRound = false;
 
             // Execute read-only tools immediately (always safe, never blocked)
             for (const toolUse of adminReadOnly) {
@@ -525,25 +530,39 @@ export async function chat(message, client) {
                 });
             }
 
-            // Cross-round safeguard: if a previous round already wrote, reject writes in this round
-            // (auto-exec AND confirmation-needing). Within the SAME round, all writes are allowed.
-            if (blockWritesThisRound && (userAutoExec.length > 0 || writeBlocks.length > 0)) {
-                logger.warn('Blocking writes in subsequent round (already wrote this turn)', {
-                    user: userId,
-                    autoExec: userAutoExec.map(b => b.name),
-                    writeBlocks: writeBlocks.map(b => b.name),
-                });
-                for (const toolUse of [...userAutoExec, ...writeBlocks]) {
-                    toolResults.push({
-                        type: 'tool_result',
-                        tool_use_id: toolUse.id,
-                        content: 'A write action was already completed this turn. Respond to the user with text instead — do not call this tool again.',
-                        is_error: true,
-                    });
+            // Cross-round safeguard (per-write): block ONLY writes whose signature
+            // matches a write that already SUCCEEDED earlier this turn. New writes
+            // (different message/input) and retries of FAILED writes go through.
+            const blockedDuplicates = [];
+
+            const allowedAutoExec = userAutoExec.filter(b => {
+                if (executedWriteKeys.has(writeKeyFor(b.name, b.input))) {
+                    blockedDuplicates.push(b);
+                    return false;
                 }
-            } else {
+                return true;
+            });
+            const allowedWriteBlocks = writeBlocks.filter(b => {
+                if (executedWriteKeys.has(writeKeyFor(b.name, b.input))) {
+                    blockedDuplicates.push(b);
+                    return false;
+                }
+                return true;
+            });
+
+            for (const toolUse of blockedDuplicates) {
+                logger.warn('Blocked duplicate write tool', { user: userId, name: toolUse.name });
+                toolResults.push({
+                    type: 'tool_result',
+                    tool_use_id: toolUse.id,
+                    content: 'This action was already completed earlier this turn. Respond to the user with text instead of repeating it.',
+                    is_error: true,
+                });
+            }
+
+            {
                 // Auto-execute user-write tools that don't need confirmation (set_timezone, short reminders)
-                for (const toolUse of userAutoExec) {
+                for (const toolUse of allowedAutoExec) {
                     const result = await executeUserTool(toolUse.name, toolUse.input, message, userId);
                     toolResults.push({
                         type: 'tool_result',
@@ -551,18 +570,18 @@ export async function chat(message, client) {
                         content: result.message,
                     });
                     if (result.aiSuggestion) aiSuggestions.push(result.aiSuggestion);
-                    didWriteThisRound = true;
+                    // Only track signatures of SUCCEEDED writes — failed ones can be legitimately retried
+                    if (result.success) executedWriteKeys.add(writeKeyFor(toolUse.name, toolUse.input));
                 }
 
                 // Write tools need confirmation (single combined card if mixed admin + user)
-                if (writeBlocks.length > 0) {
-                    const { confirmed, confirmMsgId, confirmMsg: cMsg, description } = await requestToolConfirmation(message, writeBlocks);
-                    didWriteThisRound = true; // counts even on cancel — don't re-prompt next round
+                if (allowedWriteBlocks.length > 0) {
+                    const { confirmed, confirmMsgId, confirmMsg: cMsg, description } = await requestToolConfirmation(message, allowedWriteBlocks);
 
                     if (confirmed) {
                         let hasUndoableActions = false;
 
-                        for (const toolUse of writeBlocks) {
+                        for (const toolUse of allowedWriteBlocks) {
                             let result;
                             if (isUserTool(toolUse.name)) {
                                 result = await executeUserTool(toolUse.name, toolUse.input, message, userId);
@@ -589,6 +608,9 @@ export async function chat(message, client) {
                                 tool_use_id: toolUse.id,
                                 content: result.message,
                             });
+
+                            // Track signature only on success — failed writes can be retried
+                            if (result.success) executedWriteKeys.add(writeKeyFor(toolUse.name, toolUse.input));
                         }
 
                         // Attach undo button (fire-and-forget) — only for admin actions
@@ -600,20 +622,19 @@ export async function chat(message, client) {
                         }
                     } else {
                         // User cancelled or timed out. Push tool_results so Claude can wrap up
-                        // with text, but the writesInPreviousRounds flag now prevents retries.
-                        for (const toolUse of writeBlocks) {
+                        // with text. Track signatures of cancelled writes so Claude doesn't
+                        // immediately retry the same one (treats cancel like "completed" for safeguard).
+                        for (const toolUse of allowedWriteBlocks) {
                             toolResults.push({
                                 type: 'tool_result',
                                 tool_use_id: toolUse.id,
                                 content: 'The user did not confirm this action. Acknowledge briefly in text — do NOT call this tool again with similar input.',
                             });
+                            executedWriteKeys.add(writeKeyFor(toolUse.name, toolUse.input));
                         }
                     }
-                } // close: if (writeBlocks.length > 0) — confirmation flow
-            }     // close: else of cross-round safeguard
-
-            // After this round's writes are done, set the cross-round flag for next round.
-            if (didWriteThisRound) writesInPreviousRounds = true;
+                } // close: if (allowedWriteBlocks.length > 0) — confirmation flow
+            }
 
             if (toolResults.length === 0) break;
 
