@@ -33,8 +33,6 @@ import { recordUsage } from '../db/tokenBudget.js';
 
 const SUGGESTION_MODEL = 'claude-haiku-4-5-20251001';
 
-const SHORT_REMINDER_THRESHOLD_MS = 24 * 60 * 60 * 1000; // 24h — short reminders auto-execute, no confirmation
-
 // ── Tool schemas (Anthropic tool_use format) ──
 
 export const USER_TOOL_DEFINITIONS = [
@@ -54,13 +52,13 @@ export const USER_TOOL_DEFINITIONS = [
     },
     {
         name: 'set_reminder',
-        description: 'Schedule a one-shot reminder for the current user. Pass EITHER seconds_from_now OR fire_at_local — NEVER both. Choose based on duration: under 1 hour → seconds_from_now; 1 hour or longer → fire_at_local. The 1-hour boundary is HARD — do not put 7200 (2 hours) in seconds_from_now, that will be REJECTED. For "in 2 hours", "in 3 hours", "tomorrow", etc., always use fire_at_local.',
+        description: 'Schedule a one-shot reminder for the current user. Auto-executes immediately — there is NO confirmation card. Pass EITHER seconds_from_now OR fire_at_local — NEVER both. Choose based on duration: under 1 hour → seconds_from_now; 1 hour or longer → fire_at_local. The 1-hour boundary is HARD — do not put 7200 (2 hours) in seconds_from_now, that will be REJECTED. For "in 2 hours", "in 3 hours", "tomorrow", etc., always use fire_at_local.',
         input_schema: {
             type: 'object',
             properties: {
                 message: {
                     type: 'string',
-                    description: 'The reminder text (max 500 chars).',
+                    description: 'The reminder text. PASS THE USER\'S EXACT WORDS — do NOT capitalize, do NOT add emojis, do NOT rephrase or polish. If the user says "groceries", pass "groceries". If they say "call mom", pass "call mom". The bot has a separate AI-suggestion button that lets the user opt into a polished title; your job is to preserve their intent verbatim. Max 500 chars.',
                 },
                 seconds_from_now: {
                     type: 'integer',
@@ -78,13 +76,13 @@ export const USER_TOOL_DEFINITIONS = [
     },
     {
         name: 'set_recurring_reminder',
-        description: 'Schedule a recurring (daily or weekly) reminder for the current user. Requires the user to have run /secretary on first to configure delivery preferences (DM vs channel). Recurring reminders are LIMITED to "daily" and "weekly" only — never accept "every hour", "every month", "every 5 minutes", etc.',
+        description: 'Schedule a recurring (daily or weekly) reminder for the current user. Shows a ✅/❌ confirmation card before scheduling. Requires the user to have run /secretary on first to configure delivery preferences (DM vs channel). Recurring reminders are LIMITED to "daily" and "weekly" only — never accept "every hour", "every month", "every 5 minutes", etc.',
         input_schema: {
             type: 'object',
             properties: {
                 message: {
                     type: 'string',
-                    description: 'The reminder text (max 500 chars).',
+                    description: 'The reminder text. PASS THE USER\'S EXACT WORDS — do NOT capitalize, do NOT add emojis, do NOT rephrase. The bot has a separate AI-suggestion button. Max 500 chars.',
                 },
                 recurrence: {
                     type: 'string',
@@ -142,44 +140,29 @@ export const USER_TOOL_DEFINITIONS = [
 
 const USER_TOOLS = new Set(USER_TOOL_DEFINITIONS.map(t => t.name));
 const USER_READ_ONLY_TOOLS = new Set(['list_my_reminders']);
-// Tools that bypass the confirmation card and execute immediately. set_timezone
-// is harmless (just updates the user's preference); short one-shot reminders
-// (less than 24h away) skip confirmation per UX direction.
-const USER_AUTO_EXECUTE_TOOLS = new Set(['set_timezone']);
+
+// Tools that bypass the confirmation card and execute immediately. As of v1.2,
+// only set_recurring_reminder shows a confirmation card — every other write
+// auto-executes. (Recurring needs confirmation because it persists across
+// many days and uses the user's delivery prefs from secretary mode.)
+const USER_AUTO_EXECUTE_TOOLS = new Set([
+    'set_timezone',
+    'set_reminder',
+    'cancel_reminder',
+    'reschedule_reminder',
+]);
 
 export function isUserTool(name) { return USER_TOOLS.has(name); }
 export function isReadOnlyUserTool(name) { return USER_READ_ONLY_TOOLS.has(name); }
 
 /**
  * Returns true when this user-tool call should bypass the confirmation card
- * and execute immediately. Currently:
- *   - set_timezone: always
- *   - set_reminder: when fire_at_local resolves to less than 24h away
- *
- * Long reminders (>=24h), recurring reminders, cancel, and reschedule still
- * require confirmation.
+ * and execute immediately. v1.2 simplified rule: only set_recurring_reminder
+ * requires confirmation. Everything else (one-shots, cancel, reschedule, tz)
+ * is fast-path.
  */
-export function shouldSkipConfirmation(toolName, input, userId) {
-    if (USER_AUTO_EXECUTE_TOOLS.has(toolName)) return true;
-    if (toolName !== 'set_reminder') return false;
-
-    // Sub-1h reminders specified via seconds_from_now always skip confirmation
-    // (the seconds_from_now schema caps at 3600 = 1 hour anyway).
-    if (Number.isInteger(input.seconds_from_now)) {
-        return input.seconds_from_now > 0 && input.seconds_from_now <= 3600;
-    }
-
-    // For fire_at_local input, check whether the resolved time is < 24h away
-    if (!input.fire_at_local) return false;
-    const settings = getUserSettings(userId);
-    if (!settings.timezone) return false;
-    try {
-        const utc = localToUtc(input.fire_at_local, settings.timezone);
-        const ms = utc.getTime() - Date.now();
-        return ms > 0 && ms < SHORT_REMINDER_THRESHOLD_MS;
-    } catch {
-        return false; // can't compute → fall through to normal confirmation flow (which will surface the parse error)
-    }
+export function shouldSkipConfirmation(toolName, _input, _userId) {
+    return USER_AUTO_EXECUTE_TOOLS.has(toolName);
 }
 
 const WEEKDAY_NAMES = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
