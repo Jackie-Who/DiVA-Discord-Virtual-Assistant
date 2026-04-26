@@ -49,7 +49,7 @@ export const USER_TOOL_DEFINITIONS = [
     },
     {
         name: 'set_reminder',
-        description: 'Schedule a one-shot reminder for the current user. The user MUST have set their timezone via /timezone first. Posts in the channel where the reminder was set, at the requested local time.',
+        description: 'Schedule a one-shot reminder for the current user. Pass EITHER seconds_from_now (for reminders under 1 hour from now — preferred for precision) OR fire_at_local (for reminders 1 hour or more away). NEVER pass both.',
         input_schema: {
             type: 'object',
             properties: {
@@ -57,12 +57,18 @@ export const USER_TOOL_DEFINITIONS = [
                     type: 'string',
                     description: 'The reminder text (max 500 chars).',
                 },
+                seconds_from_now: {
+                    type: 'integer',
+                    description: 'Exact seconds from now until the reminder fires. PREFER THIS for any reminder under 1 hour out — minute-rounded local time strings drift by up to 60 seconds and feel wrong when the user said "in 1 minute". Examples: "in 30 seconds" → 30, "in 1 minute" → 60, "in 5 minutes" → 300, "in half an hour" → 1800, "in 45 minutes" → 2700. Min 5, max 3600 (1 hour).',
+                    minimum: 5,
+                    maximum: 3600,
+                },
                 fire_at_local: {
                     type: 'string',
-                    description: 'When to fire, in the USER\'S local timezone, formatted "YYYY-MM-DD HH:MM" (24-hour). Compute this from "now" in their timezone (provided in the system prompt) plus their stated offset (e.g. "tomorrow at 9am" → tomorrow\'s date + "09:00").',
+                    description: 'When to fire, in the USER\'S local timezone, formatted "YYYY-MM-DD HH:MM" (24-hour). Use this ONLY for reminders 1 hour or more from now ("tomorrow at 9am", "in 3 hours", "next Monday morning"). For shorter reminders use seconds_from_now instead. The user MUST have set their timezone first.',
                 },
             },
-            required: ['message', 'fire_at_local'],
+            required: ['message'],
         },
     },
     {
@@ -152,6 +158,14 @@ export function shouldSkipConfirmation(toolName, input, userId) {
     if (USER_AUTO_EXECUTE_TOOLS.has(toolName)) return true;
     if (toolName !== 'set_reminder') return false;
 
+    // Sub-1h reminders specified via seconds_from_now always skip confirmation
+    // (the seconds_from_now schema caps at 3600 = 1 hour anyway).
+    if (Number.isInteger(input.seconds_from_now)) {
+        return input.seconds_from_now > 0 && input.seconds_from_now <= 3600;
+    }
+
+    // For fire_at_local input, check whether the resolved time is < 24h away
+    if (!input.fire_at_local) return false;
     const settings = getUserSettings(userId);
     if (!settings.timezone) return false;
     try {
@@ -175,9 +189,14 @@ export function formatUserToolForConfirmation(toolName, input, userId) {
             return `🕒 **Set timezone:** \`${input.iana_zone}\``;
         }
         case 'set_reminder': {
+            // seconds_from_now path doesn't need confirmation (auto-executes), but
+            // we still format it correctly here in case the policy changes.
+            if (Number.isInteger(input.seconds_from_now)) {
+                const utc = new Date(Date.now() + input.seconds_from_now * 1000);
+                return `⏰ **Reminder:** _"${truncate(input.message, 80)}"_\n→ ${discordTimestamp(utc, 'F')} (${discordTimestamp(utc, 'R')})`;
+            }
             try {
                 const utc = localToUtc(input.fire_at_local, tz);
-                // Discord renders these in the viewer's own locale + timezone
                 return `⏰ **Reminder:** _"${truncate(input.message, 80)}"_\n→ ${discordTimestamp(utc, 'F')} (${discordTimestamp(utc, 'R')})`;
             } catch {
                 return `⏰ Reminder: _"${truncate(input.message, 80)}"_ at ${input.fire_at_local} (${tz})`;
@@ -309,19 +328,29 @@ async function doSetReminder(input, message, userId, settings) {
     if (!text) return { success: false, message: 'Reminder message is empty.' };
     if (text.length > 500) return { success: false, message: 'Reminder message is too long (max 500 chars).' };
 
-    if (!settings.timezone || !isValidIANAZone(settings.timezone)) {
-        return { success: false, message: 'You need to set your timezone first — run `/timezone <zone>` (e.g., `America/Los_Angeles`).' };
-    }
-
     let utc;
-    try {
-        utc = localToUtc(input.fire_at_local, settings.timezone);
-    } catch (err) {
-        return { success: false, message: `Invalid time format: ${err.message}` };
-    }
-
-    if (utc.getTime() < Date.now() + 5_000) {
-        return { success: false, message: 'That time is in the past. Pick a future time.' };
+    if (Number.isInteger(input.seconds_from_now)) {
+        // Sub-1h path: precise to the second using actual current time.
+        // No timezone needed — relative offset is timezone-independent.
+        if (input.seconds_from_now < 5 || input.seconds_from_now > 3600) {
+            return { success: false, message: 'seconds_from_now must be between 5 and 3600 (1 hour). For longer reminders, use fire_at_local.' };
+        }
+        utc = new Date(Date.now() + input.seconds_from_now * 1000);
+    } else if (input.fire_at_local) {
+        // Long-reminder path: needs the user's timezone to anchor the local time.
+        if (!settings.timezone || !isValidIANAZone(settings.timezone)) {
+            return { success: false, message: 'You need to set your timezone first — run `/timezone <zone>` (e.g., `America/Los_Angeles`).' };
+        }
+        try {
+            utc = localToUtc(input.fire_at_local, settings.timezone);
+        } catch (err) {
+            return { success: false, message: `Invalid time format: ${err.message}` };
+        }
+        if (utc.getTime() < Date.now() + 5_000) {
+            return { success: false, message: 'That time is in the past. Pick a future time.' };
+        }
+    } else {
+        return { success: false, message: 'Either seconds_from_now (for reminders under 1 hour) or fire_at_local (for longer ones) must be provided.' };
     }
 
     const dbId = createOneShot({
