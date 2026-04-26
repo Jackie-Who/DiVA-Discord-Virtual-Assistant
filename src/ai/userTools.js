@@ -113,7 +113,7 @@ export const USER_TOOL_DEFINITIONS = [
     },
     {
         name: 'cancel_reminder',
-        description: 'Cancel an active reminder. Pass either `id` (preferred — visible in /reminder list) OR `query` (fuzzy match on the reminder text). If the query matches multiple, the tool returns a disambiguation list; ask the user which one.',
+        description: 'Cancel an active reminder. SHOWS A ✅/❌ CONFIRMATION CARD before deleting (destructive action). Pass either id (preferred — visible in /reminder list) OR query (fuzzy match on the reminder text). If the query matches multiple, the tool returns a disambiguation list; ask the user which one.',
         input_schema: {
             type: 'object',
             properties: {
@@ -124,7 +124,7 @@ export const USER_TOOL_DEFINITIONS = [
     },
     {
         name: 'reschedule_reminder',
-        description: 'Move a reminder to a new time. For one-shots, pass `new_fire_at_local`. For recurring, pass `new_fire_time_local` (and optionally `new_weekday` to change the day of the week for weekly rules). Pass either `id` OR `query` to identify the reminder.',
+        description: 'Move a reminder to a new time. SHOWS A ✅/❌ CONFIRMATION CARD before applying (mutates existing data). For one-shots, pass new_fire_at_local. For recurring, pass new_fire_time_local (and optionally new_weekday to change the day of the week for weekly rules). Pass either id OR query to identify the reminder.',
         input_schema: {
             type: 'object',
             properties: {
@@ -141,15 +141,14 @@ export const USER_TOOL_DEFINITIONS = [
 const USER_TOOLS = new Set(USER_TOOL_DEFINITIONS.map(t => t.name));
 const USER_READ_ONLY_TOOLS = new Set(['list_my_reminders']);
 
-// Tools that bypass the confirmation card and execute immediately. As of v1.2,
-// only set_recurring_reminder shows a confirmation card — every other write
-// auto-executes. (Recurring needs confirmation because it persists across
-// many days and uses the user's delivery prefs from secretary mode.)
+// Tools that bypass the confirmation card and execute immediately.
+// Confirmation is reserved for actions that are either:
+//   - Destructive (cancel removes data; can't be undone via the bot)
+//   - Mutate existing data (reschedule changes a reminder the user already saw)
+//   - Persistent multi-day commitments (recurring rules)
 const USER_AUTO_EXECUTE_TOOLS = new Set([
-    'set_timezone',
-    'set_reminder',
-    'cancel_reminder',
-    'reschedule_reminder',
+    'set_timezone',  // simple preference, easily reversed
+    'set_reminder',  // creating new data — easily fixed by cancelling
 ]);
 
 export function isUserTool(name) { return USER_TOOLS.has(name); }
