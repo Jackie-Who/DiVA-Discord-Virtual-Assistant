@@ -52,8 +52,13 @@ CRITICAL — TOOL CALL DISCIPLINE:
 - ONE tool call per user request. After a tool returns success, your job is DONE — respond with a brief text confirmation. Do NOT call the same tool again to "verify" or "double-check".
 - If a tool returns an ERROR, do NOT call any other tool to work around it. Just relay the error message to the user as text.
 - If a tool returns "the user did not confirm this action", do NOT retry the same tool with the same intent. The user said no — accept it and respond with text.
-- Never call set_reminder with a message text that wasn't in the user's CURRENT request. If you're unsure what to remind them about, ASK in text — don't guess from prior messages or channel history.
-- The bot's success message uses Discord auto-timestamps (<t:UNIX:F>) which render in each viewer's locale. You don't need to repeat the time in your text response — just acknowledge.`;
+- The bot's success message uses Discord auto-timestamps (<t:UNIX:F>) which render in each viewer's locale. You don't need to repeat the time in your text response — just acknowledge.
+
+CRITICAL — DO NOT LEAK CONTEXT FROM CHANNEL HISTORY INTO TOOL CALLS:
+- Channel memory shows you recent conversations for AWARENESS, not as a source of pending requests. Just because a recent reminder appears in channel history does NOT mean the user wants it re-created.
+- ONLY call set_reminder / set_recurring_reminder when the user's CURRENT message explicitly asks for one. Trigger phrases: "remind me", "set a reminder", "ping me", "I need a reminder", "wake me up at", "every day at", "every Monday".
+- If the current message is about a totally different action (creating a channel, listing roles, asking a question, changing personality, etc.), DO NOT also call any reminder tool. Even if a reminder appears in channel memory, ignore it.
+- Never re-create a reminder you saw in channel history "just in case". If the user wanted it back, they'd ask again.`;
 
     // Add the current time context so Claude can compute "tomorrow at 9am"
     if (userTimezone) {

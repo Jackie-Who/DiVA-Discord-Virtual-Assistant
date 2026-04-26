@@ -75,15 +75,29 @@ export function setNoticesEnabled(guildId, enabled) {
 }
 
 /**
- * All guilds with notices enabled — used by the update notifier on a version bump.
+ * Set of guild IDs that have EXPLICITLY disabled notices.
+ *
+ * "Opt-OUT" default means: every guild the bot is in receives notices unless
+ * an admin ran /notices off (which writes notices_enabled = 0). Guilds with no
+ * row at all are still considered enabled. The update notifier enumerates
+ * client.guilds.cache and excludes the IDs returned here.
  */
-export function getAllGuildsWithNoticesEnabled() {
+export function getDisabledNoticeGuildIds() {
     const db = getDb();
-    return db.prepare(`
-        SELECT guild_id, notices_channel_id
-        FROM guild_channels
-        WHERE notices_enabled = 1
-    `).all();
+    return new Set(
+        db.prepare(`SELECT guild_id FROM guild_channels WHERE notices_enabled = 0`)
+          .all()
+          .map(r => r.guild_id)
+    );
+}
+
+/**
+ * Returns the configured notices_channel_id for a single guild (null if not set).
+ */
+export function getNoticesChannelId(guildId) {
+    const db = getDb();
+    const row = db.prepare(`SELECT notices_channel_id FROM guild_channels WHERE guild_id = ?`).get(guildId);
+    return row?.notices_channel_id || null;
 }
 
 /**

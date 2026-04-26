@@ -18,7 +18,7 @@
 import config from '../config.js';
 import logger from './logger.js';
 import { getDb } from '../db/init.js';
-import { getAllGuildsWithNoticesEnabled } from '../db/guildChannels.js';
+import { getDisabledNoticeGuildIds, getNoticesChannelId } from '../db/guildChannels.js';
 import { BOT_VERSION, CHANGELOG } from '../version.js';
 
 /**
@@ -90,19 +90,20 @@ async function resolveNoticesChannel(client, guildId, configuredChannelId) {
 /**
  * Post a single guild's update notice. Logs and swallows any errors.
  */
-async function notifyGuild(client, guild, announcement) {
-    const channel = await resolveNoticesChannel(client, guild.guild_id, guild.notices_channel_id);
+async function notifyGuild(client, guildId, announcement) {
+    const configured = getNoticesChannelId(guildId);
+    const channel = await resolveNoticesChannel(client, guildId, configured);
     if (!channel) {
-        logger.warn('No usable notices channel — skipping', { guildId: guild.guild_id });
+        logger.warn('No usable notices channel — skipping', { guildId });
         return false;
     }
     try {
         await channel.send(announcement);
-        logger.info('Update notice posted', { guildId: guild.guild_id, channelId: channel.id });
+        logger.info('Update notice posted', { guildId, channelId: channel.id });
         return true;
     } catch (err) {
         logger.warn('Failed to post update notice (likely missing perms)', {
-            guildId: guild.guild_id,
+            guildId,
             channelId: channel.id,
             error: err.message,
         });
@@ -113,38 +114,52 @@ async function notifyGuild(client, guild, announcement) {
 /**
  * Main entry point — runs once on bot startup.
  *
- * Returns silently in dev (BOT_ENV !== 'production') so local restarts never
- * spam servers during development.
+ * In dev (BOT_ENV !== 'production') this is a no-op UNLESS opts.force is true
+ * (used by tools/fire-test-notice.js to preview the notice during development).
+ *
+ * @param {Client} client  Discord client
+ * @param {object} [opts]
+ * @param {boolean} [opts.force]    Bypass the dev gate (test mode)
+ * @param {boolean} [opts.dryRun]   Don't write last_announced_version (test mode)
  */
-export async function runUpdateNotifier(client) {
-    if (!config.isProd) {
+export async function runUpdateNotifier(client, opts = {}) {
+    const { force = false, dryRun = false } = opts;
+    if (!config.isProd && !force) {
         logger.debug('Skipping update notifier (not production)', { env: config.botEnv });
         return;
     }
 
     const lastAnnounced = getLastAnnouncedVersion();
-    if (lastAnnounced && compareVersions(BOT_VERSION, lastAnnounced) <= 0) {
+    if (!force && lastAnnounced && compareVersions(BOT_VERSION, lastAnnounced) <= 0) {
         logger.debug('No newer version to announce', { current: BOT_VERSION, last: lastAnnounced });
         return;
     }
 
-    logger.info('New version detected — posting update notices', {
+    logger.info('Posting update notices', {
         current: BOT_VERSION,
         previous: lastAnnounced || '(first run)',
+        force,
+        dryRun,
     });
 
-    let guildsToNotify;
+    // Enumerate every guild the bot is in, then drop the ones explicitly opted out.
+    let disabledIds;
     try {
-        guildsToNotify = getAllGuildsWithNoticesEnabled();
+        disabledIds = getDisabledNoticeGuildIds();
     } catch (err) {
-        logger.error('Failed to query opted-in guilds — aborting notice', { error: err.message });
+        logger.error('Failed to query disabled-notice guilds — aborting', { error: err.message });
         return;
     }
 
-    if (guildsToNotify.length === 0) {
-        logger.info('No guilds with notices enabled');
-        // Still update last_announced_version so we don't keep checking forever.
-        setLastAnnouncedVersion(BOT_VERSION);
+    const allGuildIds = [...client.guilds.cache.keys()];
+    const guildIdsToNotify = allGuildIds.filter(id => !disabledIds.has(id));
+
+    if (guildIdsToNotify.length === 0) {
+        logger.info('No guilds eligible for notices', {
+            inGuilds: allGuildIds.length,
+            disabled: disabledIds.size,
+        });
+        if (!dryRun) setLastAnnouncedVersion(BOT_VERSION);
         return;
     }
 
@@ -152,12 +167,12 @@ export async function runUpdateNotifier(client) {
     let posted = 0;
     let failed = 0;
 
-    for (const g of guildsToNotify) {
-        const ok = await notifyGuild(client, g, announcement);
+    for (const guildId of guildIdsToNotify) {
+        const ok = await notifyGuild(client, guildId, announcement);
         if (ok) posted++; else failed++;
     }
 
-    setLastAnnouncedVersion(BOT_VERSION);
+    if (!dryRun) setLastAnnouncedVersion(BOT_VERSION);
 
     logger.info('Update notice complete', {
         version: BOT_VERSION,

@@ -419,12 +419,18 @@ export async function chat(message, client) {
         // Tool use loop — handle admin tool calls with confirmation
         let rounds = 0;
         const undoButtonPromises = []; // fire-and-forget undo listeners
-        // Per-turn safeguard: once a write tool fires (or cancels), reject further
-        // write tools in the same conversation so Claude can't accidentally double-fire.
-        let writesExecutedThisTurn = false;
+        // Cross-round safeguard: once a write fires (or cancels), reject writes in
+        // SUBSEQUENT rounds. This prevents Claude from re-calling the same tool
+        // after seeing a success result. Within a single round, all writes are
+        // allowed — Claude is allowed to plan multiple tools in one response.
+        let writesInPreviousRounds = false;
 
         while (response.stop_reason === 'tool_use' && rounds < MAX_TOOL_ROUNDS) {
             rounds++;
+            // Snapshot at start of round — within this round we only consult this
+            // immutable value. We update writesInPreviousRounds at the END of the
+            // round if any writes happened, so it only affects FUTURE rounds.
+            const blockWritesThisRound = writesInPreviousRounds;
 
             const toolUseBlocks = response.content.filter(b => b.type === 'tool_use');
             // Strip web_search (server-side, no executor needed) — keep everything else for our routing
@@ -436,7 +442,7 @@ export async function chat(message, client) {
                     round: rounds,
                     user: userId,
                     blocks: customBlocks.map(b => ({ name: b.name, input_preview: JSON.stringify(b.input).slice(0, 200) })),
-                    writesExecutedThisTurn,
+                    blockWritesThisRound,
                 });
             }
 
@@ -492,8 +498,10 @@ export async function chat(message, client) {
 
             const writeBlocks = [...adminWrite, ...userWrite];
             const toolResults = [];
+            // Track whether THIS round actually wrote anything — drives the cross-round flag below.
+            let didWriteThisRound = false;
 
-            // Execute read-only tools immediately
+            // Execute read-only tools immediately (always safe, never blocked)
             for (const toolUse of adminReadOnly) {
                 const result = await executeAdminTool(toolUse.name, toolUse.input, message.guild, userId);
                 toolResults.push({
@@ -511,26 +519,16 @@ export async function chat(message, client) {
                     content: result.message,
                 });
             }
-            // Auto-execute user-write tools that don't need confirmation (set_timezone, short reminders)
-            for (const toolUse of userAutoExec) {
-                const result = await executeUserTool(toolUse.name, toolUse.input, message, userId);
-                toolResults.push({
-                    type: 'tool_result',
-                    tool_use_id: toolUse.id,
-                    content: result.message,
-                });
-                writesExecutedThisTurn = true; // counts as a write — prevents double-firing
-            }
 
-            // Write tools need confirmation (single combined card if mixed admin + user).
-            // Safeguard: if a write was already executed this turn, refuse new ones to
-            // prevent Claude from accidentally double-firing reminders/admin actions.
-            if (writeBlocks.length > 0 && writesExecutedThisTurn) {
-                logger.warn('Skipping duplicate write tools this turn', {
+            // Cross-round safeguard: if a previous round already wrote, reject writes in this round
+            // (auto-exec AND confirmation-needing). Within the SAME round, all writes are allowed.
+            if (blockWritesThisRound && (userAutoExec.length > 0 || writeBlocks.length > 0)) {
+                logger.warn('Blocking writes in subsequent round (already wrote this turn)', {
                     user: userId,
-                    blocks: writeBlocks.map(b => b.name),
+                    autoExec: userAutoExec.map(b => b.name),
+                    writeBlocks: writeBlocks.map(b => b.name),
                 });
-                for (const toolUse of writeBlocks) {
+                for (const toolUse of [...userAutoExec, ...writeBlocks]) {
                     toolResults.push({
                         type: 'tool_result',
                         tool_use_id: toolUse.id,
@@ -538,60 +536,77 @@ export async function chat(message, client) {
                         is_error: true,
                     });
                 }
-            } else if (writeBlocks.length > 0) {
-                const { confirmed, confirmMsgId, confirmMsg: cMsg, description } = await requestToolConfirmation(message, writeBlocks);
-                writesExecutedThisTurn = true; // counts even on cancel — don't re-prompt
+            } else {
+                // Auto-execute user-write tools that don't need confirmation (set_timezone, short reminders)
+                for (const toolUse of userAutoExec) {
+                    const result = await executeUserTool(toolUse.name, toolUse.input, message, userId);
+                    toolResults.push({
+                        type: 'tool_result',
+                        tool_use_id: toolUse.id,
+                        content: result.message,
+                    });
+                    didWriteThisRound = true;
+                }
 
-                if (confirmed) {
-                    let hasUndoableActions = false;
+                // Write tools need confirmation (single combined card if mixed admin + user)
+                if (writeBlocks.length > 0) {
+                    const { confirmed, confirmMsgId, confirmMsg: cMsg, description } = await requestToolConfirmation(message, writeBlocks);
+                    didWriteThisRound = true; // counts even on cancel — don't re-prompt next round
 
-                    for (const toolUse of writeBlocks) {
-                        let result;
-                        if (isUserTool(toolUse.name)) {
-                            result = await executeUserTool(toolUse.name, toolUse.input, message, userId);
-                        } else {
-                            result = await executeAdminTool(toolUse.name, toolUse.input, message.guild, userId);
-                            recordAdminToolCall(guildId);
+                    if (confirmed) {
+                        let hasUndoableActions = false;
 
-                            // Only admin tools have undo metadata
-                            if (result.undo) {
-                                recordUndoableAction(guildId, userId, confirmMsgId, result.undo);
-                                hasUndoableActions = true;
-                            }
-                            if (result.undoMulti) {
-                                for (const u of result.undoMulti) {
-                                    recordUndoableAction(guildId, userId, confirmMsgId, u);
+                        for (const toolUse of writeBlocks) {
+                            let result;
+                            if (isUserTool(toolUse.name)) {
+                                result = await executeUserTool(toolUse.name, toolUse.input, message, userId);
+                            } else {
+                                result = await executeAdminTool(toolUse.name, toolUse.input, message.guild, userId);
+                                recordAdminToolCall(guildId);
+
+                                // Only admin tools have undo metadata
+                                if (result.undo) {
+                                    recordUndoableAction(guildId, userId, confirmMsgId, result.undo);
+                                    hasUndoableActions = true;
                                 }
-                                hasUndoableActions = true;
+                                if (result.undoMulti) {
+                                    for (const u of result.undoMulti) {
+                                        recordUndoableAction(guildId, userId, confirmMsgId, u);
+                                    }
+                                    hasUndoableActions = true;
+                                }
                             }
+
+                            toolResults.push({
+                                type: 'tool_result',
+                                tool_use_id: toolUse.id,
+                                content: result.message,
+                            });
                         }
 
-                        toolResults.push({
-                            type: 'tool_result',
-                            tool_use_id: toolUse.id,
-                            content: result.message,
-                        });
+                        // Attach undo button (fire-and-forget) — only for admin actions
+                        if (hasUndoableActions && cMsg) {
+                            undoButtonPromises.push(
+                                attachUndoButton(cMsg, description, guildId, userId, confirmMsgId, message.guild)
+                                    .catch(err => logger.error('Undo button error', { error: err.message }))
+                            );
+                        }
+                    } else {
+                        // User cancelled or timed out. Push tool_results so Claude can wrap up
+                        // with text, but the writesInPreviousRounds flag now prevents retries.
+                        for (const toolUse of writeBlocks) {
+                            toolResults.push({
+                                type: 'tool_result',
+                                tool_use_id: toolUse.id,
+                                content: 'The user did not confirm this action. Acknowledge briefly in text — do NOT call this tool again with similar input.',
+                            });
+                        }
                     }
+                } // close: if (writeBlocks.length > 0) — confirmation flow
+            }     // close: else of cross-round safeguard
 
-                    // Attach undo button (fire-and-forget) — only for admin actions
-                    if (hasUndoableActions && cMsg) {
-                        undoButtonPromises.push(
-                            attachUndoButton(cMsg, description, guildId, userId, confirmMsgId, message.guild)
-                                .catch(err => logger.error('Undo button error', { error: err.message }))
-                        );
-                    }
-                } else {
-                    // User cancelled or timed out. Push tool_results so Claude can wrap up
-                    // with text, but the writesExecutedThisTurn flag now prevents retries.
-                    for (const toolUse of writeBlocks) {
-                        toolResults.push({
-                            type: 'tool_result',
-                            tool_use_id: toolUse.id,
-                            content: 'The user did not confirm this action. Acknowledge briefly in text — do NOT call this tool again with similar input.',
-                        });
-                    }
-                }
-            }
+            // After this round's writes are done, set the cross-round flag for next round.
+            if (didWriteThisRound) writesInPreviousRounds = true;
 
             if (toolResults.length === 0) break;
 
