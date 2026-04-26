@@ -377,7 +377,7 @@ async function doSetReminder(input, message, userId, settings) {
 
     return {
         success: true,
-        message: `Reminder #${position} set for ${discordTimestamp(utc, 'F')} (${discordTimestamp(utc, 'R')}). I'll ping you in this channel.`,
+        message: `Reminder #${position} set for ${discordTimestamp(utc, 'F')} (${discordTimestamp(utc, 'R')}):\n> ${text}\nI'll ping you in this channel.`,
         aiSuggestion: suggested ? { reminderId: dbId, originalTitle: text, suggestedTitle: suggested } : undefined,
     };
 }
@@ -435,7 +435,7 @@ async function doSetRecurring(input, message, userId, settings) {
 
     return {
         success: true,
-        message: `Recurring reminder #${position} set: ${when} (${settings.timezone}). First fire: ${discordTimestamp(firstUtc, 'F')} (${discordTimestamp(firstUtc, 'R')}). Delivery: ${settings.deliveryMode === 'dm' ? 'DM' : 'channel'}.`,
+        message: `Recurring reminder #${position} set: ${when} (${settings.timezone}):\n> ${text}\nFirst fire: ${discordTimestamp(firstUtc, 'F')} (${discordTimestamp(firstUtc, 'R')}). Delivery: ${settings.deliveryMode === 'dm' ? 'DM' : 'channel'}.`,
         aiSuggestion: suggested ? { reminderId: dbId, originalTitle: text, suggestedTitle: suggested } : undefined,
     };
 }
