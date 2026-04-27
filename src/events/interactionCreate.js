@@ -7,13 +7,11 @@ import timezone from '../commands/timezone.js';
 import reminder from '../commands/reminder.js';
 import secretary from '../commands/secretary.js';
 import personality from '../commands/personality.js';
+import { handlePreFireButton } from '../utils/reminderScheduler.js';
 
 // Note: as of v1.2 we removed /create-channel, /delete-channel, /ban, /kick, /purge —
 // Discord's native UI handles those better, and the bot's natural-language admin
 // tools cover the same actions when needed.
-//
-// New v1.2 commands (credits, timezone, reminder, secretary, channel, notices) are
-// registered in register.js and added to the dispatch table below as each one ships.
 
 const commands = {
     budget,
@@ -28,6 +26,26 @@ const commands = {
 
 export default function interactionCreate(client) {
     client.on('interactionCreate', async (interaction) => {
+        // Pre-fire reminder buttons (Snooze / Dismiss). Routed globally so they
+        // survive bot restarts — the message-component collector pattern doesn't
+        // work for the 1-hour pre-fire window.
+        if (interaction.isButton() && interaction.customId.startsWith('prefire_')) {
+            try {
+                await handlePreFireButton(interaction);
+            } catch (error) {
+                logger.error('Pre-fire button error', {
+                    customId: interaction.customId,
+                    user: interaction.user.id,
+                    error: error.message,
+                    stack: error.stack,
+                });
+                if (!interaction.replied && !interaction.deferred) {
+                    try { await interaction.reply({ content: 'Something went wrong handling that button.', ephemeral: true }); } catch {}
+                }
+            }
+            return;
+        }
+
         if (!interaction.isChatInputCommand()) return;
 
         const handler = commands[interaction.commandName];

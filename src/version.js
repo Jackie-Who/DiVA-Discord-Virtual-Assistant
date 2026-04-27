@@ -9,13 +9,17 @@
  * Versions are SemVer-compared (major.minor.patch).
  */
 
-export const BOT_VERSION = '1.2.0';
+export const BOT_VERSION = '1.2.1';
 
 /**
  * Per-version changelog. Entries shown in the update notice. Keep them brief
  * and user-facing (this goes to every server's notices channel).
  */
 export const CHANGELOG = {
+    '1.2.1': [
+        '🔔 **1-hour heads-up before reminders** with [Snooze 30m] and [Dismiss] buttons. Recurring reminders always get one; one-shots only if set 3+ hours out.',
+        '📅 **Daily digest revamp** — reminders now grouped into `Today`, then individual day sub-headers (e.g. _Tuesday, Apr 28_) for the next 2 days. Empty digests no longer ping.',
+    ],
     '1.2.0': [
         'Per-server credit billing replaces the global monthly budget',
         'New `/credits` to view your server\'s balance and recent transactions',

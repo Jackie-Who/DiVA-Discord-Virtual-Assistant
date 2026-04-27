@@ -179,8 +179,27 @@ function initTables() {
     runMigrations();
 }
 
+/**
+ * Add a column to a table if it doesn't already exist.
+ * SQLite's ALTER TABLE ADD COLUMN throws if the column exists, so we check first.
+ */
+function addColumnIfMissing(table, column, definition) {
+    const cols = db.prepare(`PRAGMA table_info(${table})`).all();
+    if (!cols.some(c => c.name === column)) {
+        db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+        logger.info('Added column', { table, column });
+    }
+}
+
 // One-time migrations. Idempotent — safe to run on every startup.
 function runMigrations() {
+    // v1.2.1: snooze_until_utc on reminders. When a user clicks "Snooze" on a
+    // pre-fire notification, we set this to (fire_at_utc - 30min) so a follow-up
+    // ping fires 30 minutes before the actual reminder. Cleared when the snooze
+    // ping fires or the reminder is cancelled. Persisted so snoozes survive
+    // bot restarts.
+    addColumnIfMissing('reminders', 'snooze_until_utc', 'DATETIME');
+
     // v1.2: seed guild_credits for existing prod guilds based on observed spend.
     // Decision logged in plan: each prod guild starts at $18.875 lifetime / $2.00 spent.
     //

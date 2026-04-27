@@ -192,6 +192,68 @@ export function markFired(id) {
 }
 
 /**
+ * Dismiss a SINGLE reminder instance (used by the pre-fire "Dismiss" button).
+ *
+ * Behavior:
+ *   - One-shot: marks cancelled_at on this row.
+ *   - Recurring: marks cancelled_at on this instance ONLY. The recurring rule
+ *     itself stays active — the caller (scheduler) inserts the next instance
+ *     so the rule keeps firing on its normal cadence.
+ *
+ * Returns the dismissed row on success (so the caller knows whether it was
+ * recurring and what fire_at_utc the next instance should anchor to), or null
+ * if the reminder doesn't exist / isn't owned by the user / already fired or
+ * cancelled.
+ */
+export function dismissReminderInstance(id, userId) {
+    const db = getDb();
+    const row = getReminderById(id);
+    if (!row || row.user_id !== userId || row.fired_at || row.cancelled_at) return null;
+    db.prepare(`UPDATE reminders SET cancelled_at = CURRENT_TIMESTAMP WHERE id = ? AND user_id = ?`)
+      .run(id, userId);
+    return row;
+}
+
+/**
+ * Set snooze_until_utc on a reminder. Used by the pre-fire "Snooze" button:
+ * when clicked, we set this to (fire_at_utc - 30min) and schedule a follow-up
+ * ping at that time. Returns true on success, false if the reminder isn't
+ * pending or isn't owned by the user.
+ */
+export function setSnoozeUntil(id, userId, snoozeAtUtcSqlite) {
+    const db = getDb();
+    const row = getReminderById(id);
+    if (!row || row.user_id !== userId || row.fired_at || row.cancelled_at) return false;
+    db.prepare(`UPDATE reminders SET snooze_until_utc = ? WHERE id = ? AND user_id = ?`)
+      .run(snoozeAtUtcSqlite, id, userId);
+    return true;
+}
+
+/**
+ * Clear snooze_until_utc on a reminder (called when the snooze ping fires,
+ * or when the reminder is cancelled/rescheduled).
+ */
+export function clearSnooze(id) {
+    const db = getDb();
+    db.prepare(`UPDATE reminders SET snooze_until_utc = NULL WHERE id = ?`).run(id);
+}
+
+/**
+ * All reminders with an active snooze (snooze_until_utc set, not fired, not
+ * cancelled). Used by the scheduler on startup to re-arm snooze timers.
+ */
+export function getActiveSnoozes() {
+    const db = getDb();
+    return db.prepare(`
+        SELECT * FROM reminders
+        WHERE snooze_until_utc IS NOT NULL
+          AND fired_at IS NULL
+          AND cancelled_at IS NULL
+        ORDER BY snooze_until_utc ASC
+    `).all();
+}
+
+/**
  * Replace a reminder's message text. Used by the AI-suggested-title button so
  * the user can swap their original title for an optimized version after creation.
  *

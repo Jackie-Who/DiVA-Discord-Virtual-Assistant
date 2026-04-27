@@ -23,7 +23,10 @@ import { discordTimestamp, parseSqliteUtc, nowInZone, localToUtc } from './timez
 
 const POLL_INTERVAL_MS = 5 * 60_000;       // 5 minutes
 const FIRE_WINDOW_MS  = 2.5 * 60_000;      // ±2.5 min around the user's chosen time
-const DIGEST_HORIZON_HOURS = 48;
+// 3 calendar days in the user's timezone (today + day+1 + day+2). Uses local-day
+// boundaries — not a sliding 72h window — so the digest content matches what
+// "today, tomorrow, day after" mean in the user's actual timezone.
+const DIGEST_DAYS = 3;
 const DIGEST_MODEL = 'claude-haiku-4-5-20251001';
 
 let discordClient = null;
@@ -95,26 +98,63 @@ async function checkUser(user, now) {
         }
     }
 
-    // Check the user's primary guild for credit (digests cost API calls)
-    // We approximate by using the delivery channel's guild if a channel is set,
-    // otherwise we use any guild they're known in. Simplest: skip the credit
-    // check for digests — they're cheap enough that running them is fine even
-    // when other AI features are paused. (We still record usage against the
-    // delivery guild if known, so it counts toward that guild's spend.)
+    // Build and send. Delegates to buildAndSendDigest which is also used by the
+    // dev tool (tools/test-secretary-digest.js) to preview digests on demand.
+    await buildAndSendDigest(user, now);
+}
+
+/**
+ * Build and send a single user's digest. Extracted from checkUser so the dev
+ * test script (tools/test-secretary-digest.js) can fire it on demand without
+ * tripping the fire-window or already-sent-today checks.
+ *
+ * Returns { success, kind, reminderCount, reason? } for the caller to log.
+ */
+export async function sendDigestForUserNow(client, userId) {
+    if (!client || !client.isReady?.()) {
+        return { success: false, reason: 'client not ready' };
+    }
+    // Lazy-import the user-settings DB helper to avoid circular import at module load
+    const { getUserSettings } = await import('../db/userSettings.js');
+    const settings = getUserSettings(userId);
+    if (!settings.timezone) {
+        return { success: false, reason: 'user has no timezone set' };
+    }
+    if (!settings.deliveryMode) {
+        return { success: false, reason: 'user has no delivery preference (run /secretary on)' };
+    }
+    // Reshape into the row-style object the existing helpers expect
+    const userRow = {
+        user_id: userId,
+        timezone: settings.timezone,
+        delivery_mode: settings.deliveryMode,
+        delivery_channel_id: settings.deliveryChannelId,
+        secretary_enabled: settings.secretaryEnabled ? 1 : 0,
+        secretary_time_local: settings.secretaryTimeLocal,
+        last_digest_sent_at: null, // bypass "already sent today" check
+    };
+    // Set this scheduler's client if not already (so target resolution works)
+    if (!discordClient) discordClient = client;
+    return buildAndSendDigest(userRow, Date.now());
+}
+
+async function buildAndSendDigest(user, now) {
+    const tz = user.timezone;
+    const tzNow = nowInZone(tz);
 
     const reminders = getActiveRemindersForUser(user.user_id);
-    const horizonMs = now + DIGEST_HORIZON_HOURS * 60 * 60_000;
-    const upcoming = reminders.filter(r => {
-        const fire = parseSqliteUtc(r.fire_at_utc).getTime();
-        return fire >= now && fire <= horizonMs;
-    }).sort((a, b) =>
-        parseSqliteUtc(a.fire_at_utc).getTime() - parseSqliteUtc(b.fire_at_utc).getTime()
-    );
+
+    // Bucket into local-day windows in the user's timezone:
+    //   day 0 = today (now → end of today in tz)
+    //   day 1 = tomorrow (full calendar day)
+    //   day 2 = day after tomorrow (full calendar day)
+    const dayBuckets = bucketByLocalDay(reminders, tz, now, DIGEST_DAYS);
+    const totalCount = dayBuckets.reduce((sum, b) => sum + b.items.length, 0);
 
     let intro;
     let recordToGuildId = null;
     try {
-        const result = await generateIntro(upcoming.length, tzNow);
+        const result = await generateIntro(totalCount, tzNow);
         intro = result.intro;
         recordToGuildId = await resolveRecordingGuild(user);
         if (recordToGuildId) {
@@ -122,19 +162,19 @@ async function checkUser(user, now) {
         }
     } catch (err) {
         logger.warn('Secretary: intro generation failed, falling back to default', { userId: user.user_id, error: err.message });
-        intro = upcoming.length > 0
+        intro = totalCount > 0
             ? `Good morning! Here's your day:`
             : `Good morning! Nothing on the calendar today — enjoy.`;
     }
 
-    const body = buildDigestBody(intro, upcoming);
+    const body = buildDigestBody(intro, dayBuckets, tz);
 
     // Resolve delivery target
     const target = await resolveDeliveryTarget(user);
     if (!target) {
         logger.warn('Secretary: no usable delivery target', { userId: user.user_id });
         markDigestSent(user.user_id); // still mark sent so we don't retry forever today
-        return;
+        return { success: false, reason: 'no usable delivery target' };
     }
 
     // Skip if the destination guild is out of credits (only for channel delivery)
@@ -145,27 +185,30 @@ async function checkUser(user, now) {
     }
 
     try {
-        // For channel delivery, ping the user
-        const text = target.kind === 'channel'
-            ? `<@${user.user_id}> ${body}`
-            : body;
+        // Ping ONLY when there's actual reminder content. Empty digests are
+        // informational ("nothing on the calendar"), no need to highlight.
+        const shouldPing = target.kind === 'channel' && totalCount > 0;
+        const text = shouldPing ? `<@${user.user_id}> ${body}` : body;
         await target.sendable.send(text);
         markDigestSent(user.user_id);
         logger.info('Secretary digest sent', {
             userId: user.user_id,
             kind: target.kind,
-            reminderCount: upcoming.length,
+            reminderCount: totalCount,
+            pinged: shouldPing,
         });
+        return { success: true, kind: target.kind, reminderCount: totalCount, pinged: shouldPing };
     } catch (err) {
         if (target.kind === 'dm') {
             // Fall back to channel post if DMs are closed
             const fallback = await resolveChannelTarget(user.delivery_channel_id);
             if (fallback) {
                 try {
-                    await fallback.sendable.send(`<@${user.user_id}> ${body}`);
+                    const fallbackPing = totalCount > 0 ? `<@${user.user_id}> ${body}` : body;
+                    await fallback.sendable.send(fallbackPing);
                     markDigestSent(user.user_id);
                     logger.info('Secretary digest sent via channel fallback', { userId: user.user_id });
-                    return;
+                    return { success: true, kind: 'channel', reminderCount: totalCount, pinged: totalCount > 0, fallback: true };
                 } catch (e2) {
                     logger.error('Secretary fallback channel send failed', { userId: user.user_id, error: e2.message });
                 }
@@ -173,34 +216,108 @@ async function checkUser(user, now) {
         }
         logger.error('Secretary digest send failed', { userId: user.user_id, error: err.message });
         markDigestSent(user.user_id); // give up — don't retry today
+        return { success: false, reason: err.message };
     }
 }
 
-function buildDigestBody(intro, upcoming) {
+/**
+ * Bucket a user's reminders into local-day windows in their timezone.
+ * Returns an array of { dayIndex, startMs, endMs, items } where:
+ *   dayIndex 0 = today (now → end of today in user's tz)
+ *   dayIndex 1 = tomorrow (full local calendar day)
+ *   dayIndex 2+ = day after (full local calendar day)
+ *
+ * Items are filtered to fire_at >= now and < endMs of the LAST bucket. Each
+ * item is sorted by fire_at within its bucket.
+ */
+function bucketByLocalDay(reminders, tz, now, days) {
+    // Compute "start of today in user's tz" as a UTC instant.
+    const tzNow = nowInZone(tz);
+    const todayStartLocal = `${pad(tzNow.year, 4)}-${pad(tzNow.month)}-${pad(tzNow.day)} 00:00`;
+    let todayStartUtc;
+    try {
+        todayStartUtc = localToUtc(todayStartLocal, tz);
+    } catch {
+        todayStartUtc = new Date(now); // best-effort fallback
+    }
+
+    const dayMs = 24 * 60 * 60_000;
+    const buckets = [];
+    for (let i = 0; i < days; i++) {
+        const dayStart = todayStartUtc.getTime() + i * dayMs;
+        const dayEnd = dayStart + dayMs;
+        // For day 0, lower bound is "now" (don't list reminders that already passed today)
+        const lowerBound = i === 0 ? Math.max(dayStart, now) : dayStart;
+        const items = reminders
+            .map(r => ({ row: r, fireMs: parseSqliteUtc(r.fire_at_utc).getTime() }))
+            .filter(({ fireMs }) => fireMs >= lowerBound && fireMs < dayEnd)
+            .sort((a, b) => a.fireMs - b.fireMs)
+            .map(({ row }) => row);
+        buckets.push({ dayIndex: i, startMs: dayStart, endMs: dayEnd, items });
+    }
+    return buckets;
+}
+
+const WEEKDAY_NAMES = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
+const MONTH_NAMES_SHORT = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+
+/**
+ * Returns the weekday + short month + day for a UTC instant in a given tz.
+ * Used to label day buckets like "Tuesday, Apr 29".
+ */
+function dayLabel(utcMs, tz) {
+    try {
+        const fmt = new Intl.DateTimeFormat('en-CA', {
+            timeZone: tz, weekday: 'long', month: 'short', day: 'numeric',
+        });
+        const parts = fmt.formatToParts(new Date(utcMs));
+        const get = (t) => parts.find(p => p.type === t)?.value;
+        const weekday = get('weekday');
+        const month = get('month');
+        const day = get('day');
+        return { weekday, month, day, label: `${weekday}, ${month} ${day}` };
+    } catch {
+        return { weekday: '', month: '', day: '', label: '' };
+    }
+}
+
+function pad(n, len = 2) { return String(n).padStart(len, '0'); }
+
+function buildDigestBody(intro, dayBuckets, tz) {
     let body = `🌅 **${intro}**`;
-    if (upcoming.length === 0) {
-        body += '\n\n_Nothing on the calendar in the next 48 hours._';
+
+    const totalCount = dayBuckets.reduce((sum, b) => sum + b.items.length, 0);
+    if (totalCount === 0) {
+        body += `\n\n_Nothing on the calendar in the next ${DIGEST_DAYS} days._`;
         return body;
     }
 
-    const todayList = [];
-    const laterList = [];
-    const dayMs = 24 * 60 * 60_000;
-    const now = Date.now();
-    for (const r of upcoming) {
-        const fireMs = parseSqliteUtc(r.fire_at_utc).getTime();
-        const within24h = (fireMs - now) <= dayMs;
-        const line = `• ${discordTimestamp(parseSqliteUtc(r.fire_at_utc), 't')} — ${r.message.slice(0, 100)}${r.recurrence ? ` _(${r.recurrence})_` : ''}`;
-        (within24h ? todayList : laterList).push(line);
+    // Today section — includes the date so the user can see it at a glance
+    const today = dayBuckets[0];
+    if (today && today.items.length > 0) {
+        const { month, day } = dayLabel(today.startMs, tz);
+        body += `\n\n### 📍 Today, ${month} ${day}\n`;
+        body += today.items.map(formatDigestLine).join('\n');
     }
 
-    if (todayList.length > 0) {
-        body += `\n\n**Today:**\n${todayList.join('\n')}`;
+    // Coming up section: days 1..N-1 with sub-headers per day, only days with items
+    const upcoming = dayBuckets.slice(1).filter(b => b.items.length > 0);
+    if (upcoming.length > 0) {
+        body += `\n\n### 📅 Coming up\n`;
+        for (const bucket of upcoming) {
+            const { label } = dayLabel(bucket.startMs, tz);
+            body += `\n**${label}:**\n`;
+            body += bucket.items.map(formatDigestLine).join('\n');
+        }
     }
-    if (laterList.length > 0) {
-        body += `\n\n**Coming up (next 48h):**\n${laterList.join('\n')}`;
-    }
+
     return body;
+}
+
+function formatDigestLine(r) {
+    const time = discordTimestamp(parseSqliteUtc(r.fire_at_utc), 't');
+    const recurringTag = r.recurrence ? ` _(${r.recurrence})_` : '';
+    return `• ${time} — ${r.message.slice(0, 100)}${recurringTag}`;
 }
 
 async function generateIntro(reminderCount, tzNow) {
@@ -273,5 +390,3 @@ function sameLocalDay(a, b, tz) {
     }).format(b);
     return aStr === bStr;
 }
-
-function pad(n, len = 2) { return String(n).padStart(len, '0'); }
