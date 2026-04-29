@@ -1,6 +1,23 @@
 # DiVA — **Di**scord **V**irtual **A**ssistant
 
-A Claude-powered Discord bot with natural-language reminders, an evolving personality system, multi-model routing (Haiku + Sonnet), per-server credit billing, admin tools with confirmation/undo, per-channel memory, and per-user secretary mode for daily digests.
+A Claude-powered, **open-source** Discord assistant with natural-language reminders, an evolving per-server personality, multi-model routing (Haiku + Sonnet), per-server credit billing, admin tools with confirmation/undo, channel memory, image analysis, web search, and a per-user daily secretary digest.
+
+[**Privacy Policy**](./PRIVACY.md) · [**Terms of Service**](./TERMS.md) · [**License (MIT)**](./LICENSE)
+
+---
+
+## Two ways to use DiVA
+
+|  | **Managed instance** | **Self-hosted** |
+|---|---|---|
+| **What it is** | The maintainer runs DiVA, you invite it to your server | You clone the repo and host your own copy |
+| **Setup time** | One click on the invite URL below | ~10 minutes (Node 20, Discord app, Anthropic key) |
+| **AI cost** | Per-server credit packs (free $1 sign-up bonus, $5/$10/$25/$50/$100 tiers — Stripe, paid launch coming) | Bring your own Anthropic key, pay Anthropic directly |
+| **Updates** | Automatic, with an in-server changelog notice | You pull and redeploy when you want |
+| **Privacy posture** | [Operator's Privacy Policy](./PRIVACY.md) applies | You become the data controller — write your own policy |
+| **License** | MIT (you can fork at any time) | MIT (this repo) |
+
+DiVA is one of the few AI Discord bots that's **fully open-source**. If you don't want to depend on the maintainer's hosted instance, fork it and run it yourself — the code in this repo is the same code the maintainer runs in production. No hidden modules, no closed-source SaaS lock-in.
 
 > DiVA can appear under a different nickname on any server via Discord's built-in "Change Nickname" feature. The global bot identity is DiVA, but individual servers can rename it (e.g., "kurbot").
 
@@ -145,19 +162,46 @@ For Railway: set `DATA_DIR=/app/data` and attach a persistent volume at `/app/da
 
 ## Discord Permissions
 
-DiVA needs:
+DiVA offers two invite paths — pick the one that matches how much trust you want to grant.
 
-- Send Messages, Read Message History, Add Reactions
-- Manage Channels, Manage Roles, Manage Messages
-- Manage Emojis, Manage Events, Manage Nicknames
-- Use Slash Commands
+### Option A — Administrator (recommended for most servers)
 
-**Permissions integer:** `1507328214086`
+Easiest setup. Grants every permission, so DiVA never trips on a missing scope when you ask it to do something. This is what most AI-bot competitors require.
 
-Invite URL (replace `YOUR_CLIENT_ID`):
+**Permissions integer:** `8`
+
 ```
-https://discord.com/api/oauth2/authorize?client_id=YOUR_CLIENT_ID&permissions=1507328214086&scope=bot%20applications.commands
+https://discord.com/api/oauth2/authorize?client_id=YOUR_CLIENT_ID&permissions=8&scope=bot%20applications.commands
 ```
+
+### Option B — Minimum scope (for security-conscious servers)
+
+Grants only what DiVA's admin tools actually exercise. **No `Ban`, `Kick`, `Timeout`, `Mute`, `Deafen`, `Move Members`, `Mention Everyone`, `Manage Messages`, or `Manage Webhooks`** — DiVA stays out of moderation territory entirely.
+
+**Messaging (core):**
+- View Channel, Send Messages, Send Messages In Threads
+- Read Message History, Embed Links, Attach Files
+- Add Reactions, Use External Emojis
+- Use Application (Slash) Commands
+
+**Admin tools (only what's actually used):**
+- Manage Channels — create/edit/move text/voice/stage/forum/announcement channels and categories
+- Manage Roles — create/edit roles, set channel permission overwrites
+- Manage Server — edit server name, AFK channel, system channel, notification level
+- Manage Nicknames — set or clear member nicknames
+- Manage Server Expressions — create/rename emojis
+- Manage Events — create scheduled events
+- Manage Threads, Create Public Threads, Create Private Threads — thread CRUD
+
+**Permissions integer:** `407351184496`
+
+```
+https://discord.com/api/oauth2/authorize?client_id=YOUR_CLIENT_ID&permissions=407351184496&scope=bot%20applications.commands
+```
+
+> **Trade-off for Option B:** if DiVA's token ever leaks, the blast radius is contained — no member bans, no channel mass-deletes. The cost is that some niche admin requests (e.g. asking DiVA to grant another role the `MentionEveryone` permission) will fail because DiVA itself doesn't hold that permission to delegate.
+
+> **Already invited DiVA on a previous version?** The pre-v1.2.2 invite URL (`1507328214086`) was inaccurate — it included moderation permissions DiVA never used and was missing several it actually needs. Either re-invite with one of the URLs above, or just grant DiVA the Administrator role manually in your server's role settings.
 
 ## Slash Commands
 
@@ -179,8 +223,23 @@ https://discord.com/api/oauth2/authorize?client_id=YOUR_CLIENT_ID&permissions=15
 | `/notices off` | Manage Server | Disable update notices for this server |
 | `/personality view` | Administrator | View the bot's evolved personality |
 | `/personality reset` | Administrator | Reset the personality to start fresh |
+| `/admin-audit [user]` | Manage Server | Show recent admin-tool actions DiVA performed in this server (90-day retention) |
+| `/data-export` | Anyone | Download a JSON copy of all DiVA data linked to your account, across every server (GDPR right of access) |
+| `/data-delete` | Anyone | Delete your DiVA data **for this server only** — your data in other servers is unaffected. Two-step confirmation. |
+| `/server-data-export` | Manage Server | Download a JSON copy of all server-level DiVA data for this guild (no user-personal content) |
+| `/server-data-delete` | Manage Server | Reset DiVA's server-level config (personality + channel routing). Does NOT touch credits or user data. |
 
 > Reminder creation, cancellation, rescheduling, and most admin actions happen via natural language (@mention the bot) — slash commands are the visual management surface.
+
+### Privacy & data rights
+
+DiVA ships GDPR/CCPA/PIPEDA-compliant tooling out of the box:
+
+- **Per-user**: `/data-export` (cross-server JSON dump), `/data-delete` (per-server hard-delete + anonymization with cross-server scope preserved separately for `/timezone` and `/secretary clear`)
+- **Per-server**: `/server-data-export` (admin-only, server-level config + aggregated metrics), `/server-data-delete` (admin-only, resets personality + channel routing)
+- **Per-server forensics**: `/admin-audit` lets server admins see every admin-tool action DiVA has performed in their guild over the last 90 days
+
+See [PRIVACY.md](./PRIVACY.md) for retention windows, sub-processor disclosure, and the full data-flow audit.
 
 ## Configuration
 
@@ -218,7 +277,7 @@ src/
     personality.js       — Personality digest system (Haiku-powered)
     client.js            — Anthropic SDK client
   db/
-    init.js              — SQLite setup (WAL mode, 11 tables) + idempotent v1.2 migration
+    init.js              — SQLite setup (WAL mode, 12 tables) + idempotent migrations
     credits.js           — Per-guild credit ledger (lifetime/spent/owner_managed)
     history.js           — Conversation storage + channel memory
     personality.js       — Guild personality CRUD
@@ -226,7 +285,11 @@ src/
     tokenBudget.js       — Per-call usage recording, delegates to credits
     userSettings.js      — Per-user timezone + secretary preferences
     guildChannels.js     — Per-guild error/metrics/notices channel routing
-  commands/               — Slash command handlers (8 active commands)
+    adminAudit.js        — 90-day admin-tool audit log (recordCall, listRecent, cleanup)
+    userDataExport.js    — Cross-server user-data assembler (for /data-export)
+    userDataDelete.js    — Per-server user-data delete + anonymization helpers
+    serverData.js        — Server-level export + reset helpers
+  commands/               — Slash command handlers (13 active commands)
   events/                 — Discord event handlers (ready, messageCreate, interactionCreate)
   utils/
     rateLimiter.js       — Per-user + per-channel rate limiting
@@ -255,9 +318,16 @@ tools/
 - **Runtime:** Node.js 20+ (ESM)
 - **AI:** Claude Sonnet 4.6 + Haiku 4.5 via `@anthropic-ai/sdk`
 - **Discord:** discord.js v14
-- **Database:** SQLite (better-sqlite3) with WAL mode, 11 tables
+- **Database:** SQLite (better-sqlite3) with WAL mode, 12 tables
 - **Deployment:** Docker / Railway / PM2
 
-## License
+## Contributing
 
-MIT — see [LICENSE](./LICENSE).
+Bug reports, feature requests, and pull requests are welcome — open a [GitHub issue](https://github.com/Jackie-Who/DiVA-Discord-Virtual-Assistant/issues) to start a discussion. Self-hosted forks are free to diverge under MIT; contributions back to this repo are appreciated but never required.
+
+## License & Legal
+
+- **Code:** [MIT](./LICENSE) — fork, modify, redistribute, sell. Attribution preserved in the LICENSE file is enough.
+- **Privacy Policy** (governs the maintainer-run managed instance): [PRIVACY.md](./PRIVACY.md)
+- **Terms of Service** (governs the managed instance): [TERMS.md](./TERMS.md)
+- **Self-hosted instances** are not covered by the maintainer's privacy policy or ToS. If you self-host, you become the data controller for your users and should publish your own.

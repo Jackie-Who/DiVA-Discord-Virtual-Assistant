@@ -7,6 +7,11 @@ import timezone from '../commands/timezone.js';
 import reminder from '../commands/reminder.js';
 import secretary from '../commands/secretary.js';
 import personality from '../commands/personality.js';
+import adminAudit from '../commands/adminAudit.js';
+import dataExport from '../commands/dataExport.js';
+import dataDelete from '../commands/dataDelete.js';
+import serverDataExport from '../commands/serverDataExport.js';
+import serverDataDelete from '../commands/serverDataDelete.js';
 import { handlePreFireButton } from '../utils/reminderScheduler.js';
 
 // Note: as of v1.2 we removed /create-channel, /delete-channel, /ban, /kick, /purge —
@@ -22,6 +27,11 @@ const commands = {
     reminder,
     secretary,
     personality,
+    'admin-audit': adminAudit,
+    'data-export': dataExport,
+    'data-delete': dataDelete,
+    'server-data-export': serverDataExport,
+    'server-data-delete': serverDataDelete,
 };
 
 export default function interactionCreate(client) {

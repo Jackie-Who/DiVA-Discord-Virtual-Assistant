@@ -1,8 +1,9 @@
 import { ChannelType, PermissionFlagsBits, PermissionsBitField, ThreadAutoArchiveDuration, GuildScheduledEventEntityType, GuildScheduledEventPrivacyLevel } from 'discord.js';
 import logger from '../utils/logger.js';
 import { notifyError } from '../utils/errorNotifier.js';
-import { checkAdminRateLimit, recordAdminToolCall } from '../utils/adminRateLimiter.js';
+import { checkAdminRateLimit, recordAdminToolCall as recordAdminRateLimitCall } from '../utils/adminRateLimiter.js';
 import { getDb } from '../db/init.js';
+import { recordAdminToolCall as recordAdminAuditEntry } from '../db/adminAudit.js';
 
 // ── Input sanitization ──
 
@@ -705,7 +706,38 @@ function findThread(guild, name) {
 
 // ── Tool executor ──
 
+/**
+ * Public entry point. Wraps executeAdminToolImpl with a guaranteed audit-log
+ * write on every exit path (success, validation failure, permission denial,
+ * rate-limit, or thrown error). Audit failure is swallowed inside the
+ * recorder; never blocks the user-facing return.
+ */
 export async function executeAdminTool(toolName, input, guild, userId) {
+    let result;
+    try {
+        result = await executeAdminToolImpl(toolName, input, guild, userId);
+    } catch (err) {
+        // Defensive — executeAdminToolImpl already has a try/catch around its
+        // switch body, so this should be unreachable. If we ever get here,
+        // something has gone very wrong; record it as a failed audit entry
+        // and return a generic message.
+        logger.error('executeAdminTool: uncaught error escaped impl', {
+            toolName, error: err.message, stack: err.stack,
+        });
+        result = { success: false, message: 'Something went wrong executing that action.' };
+    }
+    recordAdminAuditEntry({
+        guildId: guild?.id,
+        userId,
+        toolName,
+        input,
+        success: !!result?.success,
+        errorMessage: result?.success ? null : (result?.message || null),
+    });
+    return result;
+}
+
+async function executeAdminToolImpl(toolName, input, guild, userId) {
     // ── Server-side allowlist check ──
     if (!ALLOWED_TOOLS.has(toolName)) {
         await notifyError({
@@ -734,7 +766,7 @@ export async function executeAdminTool(toolName, input, guild, userId) {
         const retrySeconds = Math.ceil(rateCheck.retryAfterMs / 1000);
         return { success: false, message: `Too many admin actions in a short time. Try again in ${retrySeconds} seconds.` };
     }
-    recordAdminToolCall(guild.id);
+    recordAdminRateLimitCall(guild.id);
 
     try {
         switch (toolName) {

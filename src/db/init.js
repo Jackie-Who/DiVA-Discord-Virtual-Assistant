@@ -174,6 +174,30 @@ function initTables() {
             value TEXT NOT NULL,
             updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
         );
+
+        -- ── v1.2.2 tables ──
+
+        -- Audit trail for every admin-tool execution (success or failure).
+        -- Used for abuse investigation and the /admin-audit slash command.
+        -- Retention: 90 days (sweep alongside undo_actions cleanup).
+        -- input_json is capped at INPUT_JSON_MAX_LEN bytes to bound storage and
+        -- avoid persisting unbounded user content (channel topics, role names, etc).
+        CREATE TABLE IF NOT EXISTS admin_tool_audit (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            guild_id TEXT NOT NULL,
+            user_id TEXT NOT NULL,
+            tool_name TEXT NOT NULL,
+            input_json TEXT,
+            success INTEGER NOT NULL,
+            error_message TEXT,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_admin_audit_guild
+        ON admin_tool_audit(guild_id, created_at DESC);
+
+        CREATE INDEX IF NOT EXISTS idx_admin_audit_user
+        ON admin_tool_audit(user_id, created_at DESC);
     `);
 
     runMigrations();

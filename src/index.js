@@ -5,6 +5,7 @@ import { initErrorNotifier, notifyError } from './utils/errorNotifier.js';
 import { getDb } from './db/init.js';
 import { startBackupScheduler } from './utils/backup.js';
 import { cleanupExpiredUndoActions } from './ai/adminTools.js';
+import { cleanupExpiredAuditEntries } from './db/adminAudit.js';
 import { initWeeklyMetrics } from './utils/weeklyMetrics.js';
 import { initReminderScheduler } from './utils/reminderScheduler.js';
 import { initSecretaryScheduler } from './utils/secretaryScheduler.js';
@@ -35,6 +36,10 @@ startBackupScheduler();
 
 // Clean up expired undo actions every 5 minutes
 setInterval(() => cleanupExpiredUndoActions(), 5 * 60_000);
+
+// Prune admin-tool audit rows older than 90 days. Once an hour is plenty —
+// the table grows slowly and we don't need second-precision deletion.
+setInterval(() => cleanupExpiredAuditEntries(), 60 * 60_000);
 
 // Create Discord client
 const client = new Client({
