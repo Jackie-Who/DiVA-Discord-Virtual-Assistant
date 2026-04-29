@@ -133,7 +133,7 @@ const commands = [
 
     new SlashCommandBuilder()
         .setName('server-data-delete')
-        .setDescription('Reset DiVA\'s server-level config (personality + channel routing) — does not touch credits or user data')
+        .setDescription('Reset server-level config (personality + channel routing). Credits + user data untouched.')
         .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
 ];
 
