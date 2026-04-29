@@ -201,9 +201,9 @@ If any of these Terms conflicts with the platforms above, the platform terms con
 
 ## 15. Governing law and disputes
 
-These Terms are governed by the laws of the maintainer's jurisdiction without regard to conflict-of-laws rules. Any dispute arising from these Terms or the Service will be resolved in the courts of that jurisdiction, unless mandatory consumer-protection law in your country grants you another forum.
+These Terms are governed by the **laws of the Province of British Columbia and the federal laws of Canada applicable therein**, without regard to conflict-of-laws rules. Any dispute arising from these Terms or the Service will be resolved in the courts located in British Columbia, Canada, unless mandatory consumer-protection law in your country of residence grants you another forum or stronger protection.
 
-> *(The specific governing-law jurisdiction will be added in a future revision once the Operator finalizes their place of business. Until then, mandatory local law in your country applies wherever it gives you stronger protection.)*
+If you are an individual consumer in a jurisdiction (such as the EU, UK, or your home province in Canada) that grants you mandatory rights or a local forum, those rights are not waived by this clause.
 
 ---
 
