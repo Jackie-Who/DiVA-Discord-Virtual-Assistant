@@ -5,6 +5,7 @@
  * Per-guild cooldown: max 10 tool calls per 60 seconds.
  */
 
+import config from '../config.js';
 import logger from './logger.js';
 
 const MAX_CALLS = 10;
@@ -30,6 +31,10 @@ setInterval(() => {
  * @returns {{ allowed: boolean, remainingCalls: number, retryAfterMs: number }}
  */
 export function checkAdminRateLimit(guildId) {
+    if (config.rateLimitsDisabled) {
+        return { allowed: true, remainingCalls: Infinity, retryAfterMs: 0 };
+    }
+
     const now = Date.now();
 
     if (!guildCalls.has(guildId)) {

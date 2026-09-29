@@ -4,6 +4,8 @@ const userTimestamps = new Map();
 const channelTimestamps = new Map();
 
 export function isRateLimited(userId, channelId) {
+    if (config.rateLimitsDisabled) return false;
+
     const now = Date.now();
 
     // Per-user limit: 1 message per N seconds

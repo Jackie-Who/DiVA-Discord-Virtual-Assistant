@@ -49,7 +49,9 @@ const config = Object.freeze({
     maxResponseTokens: parseInt(process.env.MAX_RESPONSE_TOKENS) || 512,
     personalityDigestInterval: parseInt(process.env.PERSONALITY_DIGEST_INTERVAL) || 15,
 
-    // Rate Limiting
+    // Rate Limiting. RATE_LIMITS_DISABLED=true bypasses both the chat limiter
+    // and the per-guild admin-tool limiter.
+    rateLimitsDisabled: process.env.RATE_LIMITS_DISABLED === 'true',
     rateLimitUserSeconds: parseInt(process.env.RATE_LIMIT_USER_SECONDS) || 5,
     rateLimitChannelCount: parseInt(process.env.RATE_LIMIT_CHANNEL_COUNT) || 5,
     rateLimitChannelSeconds: parseInt(process.env.RATE_LIMIT_CHANNEL_SECONDS) || 10,
