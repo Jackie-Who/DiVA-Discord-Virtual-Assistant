@@ -56,6 +56,19 @@ export function assembleServerDataExport(guildId) {
         SELECT * FROM guild_personality WHERE guild_id = ?
     `).get(guildId) || null;
 
+    const roleSelectors = db.prepare(`
+        SELECT message_id, channel_id, title, description, exclusive, created_by, created_at, updated_at
+        FROM role_selectors
+        WHERE guild_id = ?
+        ORDER BY created_at ASC
+    `).all(guildId).map(s => ({
+        ...s,
+        options: db.prepare(`
+            SELECT role_id, emoji, label, position FROM role_selector_options
+            WHERE message_id = ? ORDER BY position ASC
+        `).all(s.message_id),
+    }));
+
     // Aggregate token usage by day. Excludes user_id and message content.
     const tokenUsageDaily = db.prepare(`
         SELECT DATE(created_at) AS day,
@@ -85,6 +98,11 @@ export function assembleServerDataExport(guildId) {
         },
         guild_channels: guildChannels,
         guild_personality: guildPersonality,
+        role_selectors: {
+            count: roleSelectors.length,
+            note: 'Live role selector messages and their role buttons.',
+            rows: roleSelectors,
+        },
         token_usage_daily: {
             count: tokenUsageDaily.length,
             note: 'Aggregated per-day. No per-user, no per-message detail.',

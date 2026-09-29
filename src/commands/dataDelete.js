@@ -58,13 +58,14 @@ export default async function dataDelete(interaction) {
         `• \`undo_actions\`: **${counts.undo_actions}** row${counts.undo_actions === 1 ? '' : 's'} — _hard deleted_`,
         `• \`token_usage\`: **${counts.token_usage}** row${counts.token_usage === 1 ? '' : 's'} — _anonymized_ (cost stays in server billing, not linked to you)`,
         `• \`admin_tool_audit\`: **${counts.admin_tool_audit}** row${counts.admin_tool_audit === 1 ? '' : 's'} — _anonymized_ (server admins keep abuse-investigation history, your linkage is severed)`,
+        counts.role_selectors > 0 ? `• \`role_selectors\`: **${counts.role_selectors}** you created — _authorship anonymized_ (the selectors stay live for the server)` : null,
         '',
         '**Not affected by this command:**',
         '• Your timezone, secretary preferences, and delivery channel — these are cross-server. Use `/timezone` or `/secretary clear` if you want those gone too.',
         '• Your data in any **other** server DiVA is in. Run `/data-delete` separately in each one.',
         '',
         '**This action cannot be undone.** Confirmation expires in 60 seconds.',
-    ].join('\n');
+    ].filter(line => line !== null).join('\n');
 
     const row = new ActionRowBuilder().addComponents(
         new ButtonBuilder().setCustomId(confirmId).setLabel('Delete my data').setStyle(ButtonStyle.Danger).setEmoji('🗑️'),
@@ -100,9 +101,10 @@ export default async function dataDelete(interaction) {
                 `• Undo actions: ${result.undo_actions_deleted} deleted`,
                 `• Token usage: ${result.token_usage_anonymized} anonymized`,
                 `• Admin tool audit: ${result.admin_tool_audit_anonymized} anonymized`,
+                result.role_selectors_anonymized > 0 ? `• Role selectors you created: ${result.role_selectors_anonymized} anonymized (still live)` : null,
                 '',
                 'Your timezone and secretary preferences were not touched (they\'re cross-server). Use `/timezone` or `/secretary clear` if you want to reset those too.',
-            ].join('\n');
+            ].filter(line => line !== null).join('\n');
 
             await i.update({ content: summaryAfter, components: [] });
         } catch (err) {

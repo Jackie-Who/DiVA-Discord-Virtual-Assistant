@@ -81,6 +81,20 @@ Admins can manage the server by chatting:
 
 Write operations show a ✅/❌ confirmation card. After execution, an ↩️ Undo button appears for 5 minutes (persisted to SQLite — survives restarts). Destructive actions (deleting channels/roles, kicking, banning) are blocked by policy.
 
+### Role Selectors (button roles)
+Self-assign roles, like Carl-bot or MEE6 reaction roles, set up by asking:
+
+> _"@DiVA make a role selector in #roles for Valorant 🔫, Minecraft ⛏️, and Rocket League 🏎️"_
+
+- DiVA posts a permanent message with one button per role. Members **click to get a role, click again to drop it**, and DiVA confirms with a private message only they can see.
+- The confirmation card shows a **live preview** of the exact message before anything is posted
+- Change it later by asking: _"add Fortnite to the role selector"_, _"remove Minecraft from 1234…"_, _"change Valorant's emoji to 🎯"_, _"make it pick-one"_. Pass a message ID or link, or DiVA finds it when there's only one.
+- **Pick-one mode** for regions, ranks, or colors — choosing a new role swaps out the old one
+- Up to 25 roles per selector. Works forever, across restarts.
+- **Who can manage:** Administrator, Manage Server, or **Manage Roles** (so moderators can run it without full admin)
+- **Safety:** roles with moderator-level permissions, integration/booster roles, and roles above DiVA or above the person configuring it are refused, and every click re-checks the role
+- If a role or the selector message is deleted, DiVA cleans up after itself
+
 ### Per-Server Notification Channels
 Each server admin can route notifications to channels of their choice:
 
@@ -271,13 +285,14 @@ All configuration via environment variables. See `.env.dev.example` and `.env.pr
 src/
   ai/
     chat.js              — Main chat logic, model routing, tool execution loop
-    adminTools.js        — 23 admin tools with sanitization + confirmation + undo
+    adminTools.js        — 29 admin tools with sanitization + confirmation + undo + live previews
+    roleSelectorTools.js — 6 role selector tools (plan → preview → execute)
     userTools.js         — 6 user tools (timezone, set_reminder, recurring, list, cancel, reschedule)
     systemPrompt.js      — Dynamic system prompt with user context (tz, current local time, delivery prefs)
     personality.js       — Personality digest system (Haiku-powered)
     client.js            — Anthropic SDK client
   db/
-    init.js              — SQLite setup (WAL mode, 12 tables) + idempotent migrations
+    init.js              — SQLite setup (WAL mode, 14 tables) + idempotent migrations
     credits.js           — Per-guild credit ledger (lifetime/spent/owner_managed)
     history.js           — Conversation storage + channel memory
     personality.js       — Guild personality CRUD
@@ -289,6 +304,7 @@ src/
     userDataExport.js    — Cross-server user-data assembler (for /data-export)
     userDataDelete.js    — Per-server user-data delete + anonymization helpers
     serverData.js        — Server-level export + reset helpers
+    roleSelectors.js     — Role selector + button option storage
   commands/               — Slash command handlers (13 active commands)
   events/                 — Discord event handlers (ready, messageCreate, interactionCreate)
   utils/
@@ -298,6 +314,7 @@ src/
     secretaryScheduler.js— 5-min poll for daily digest delivery
     updateNotifier.js    — Version-bump announcements (idempotent, prod-only)
     aiSuggestionButton.js— ✨ AI-suggested reminder title button + listener
+    roleSelectors.js     — Selector rendering, role safety checks, click handler, cleanup listeners
     timezone.js          — IANA tz helpers + Discord auto-timestamp formatter
     backup.js            — Daily DB backup with retention
     weeklyMetrics.js     — Owner global + per-guild weekly reports

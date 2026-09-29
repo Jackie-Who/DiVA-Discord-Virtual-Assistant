@@ -67,6 +67,14 @@ export function assembleUserDataExport(userId) {
         ORDER BY created_at DESC
     `).all(userId);
 
+    // — role_selectors created by this user (cross-guild) —
+    const roleSelectorsCreated = db.prepare(`
+        SELECT message_id, guild_id, channel_id, title, description, exclusive, created_at, updated_at
+        FROM role_selectors
+        WHERE created_by = ?
+        ORDER BY created_at DESC
+    `).all(userId);
+
     // — undo_actions (cross-guild, 10-min TTL but include for completeness) —
     const undoActions = db.prepare(`
         SELECT id, guild_id, confirm_msg_id, action_json, created_at
@@ -109,6 +117,11 @@ export function assembleUserDataExport(userId) {
             note: 'Pending undo records (10-minute TTL). Usually empty.',
             rows: undoActions,
         },
+        role_selectors_created: {
+            count: roleSelectorsCreated.length,
+            note: 'Role selector messages you created. The selector itself belongs to the server; only your authorship is personal data.',
+            rows: roleSelectorsCreated,
+        },
     };
 }
 
@@ -126,5 +139,6 @@ export function countUserData(userId) {
         token_usage: get(`SELECT COUNT(*) AS n FROM token_usage WHERE user_id = ?`),
         admin_tool_audit: get(`SELECT COUNT(*) AS n FROM admin_tool_audit WHERE user_id = ?`),
         undo_actions: get(`SELECT COUNT(*) AS n FROM undo_actions WHERE user_id = ?`),
+        role_selectors_created: get(`SELECT COUNT(*) AS n FROM role_selectors WHERE created_by = ?`),
     };
 }

@@ -71,6 +71,7 @@ When you ask DiVA to suggest a title for a reminder, the reminder text is sent t
 - Optional channel routing: which channel should receive errors, weekly metrics, or update notices for your server
 - Whether your server has opted out of update notices
 - An **admin-tool audit log** — every time DiVA performs an administrative action in your server on behalf of a user (creating a channel, assigning a role, editing the server name, etc.), one row is written including the requesting user ID, the tool name, a truncated copy of the structured input (capped at 500 characters), success/failure, and the timestamp. This is used by the `/admin-audit` command (server admins only) to investigate "who did what". Retention: 90 days.
+- **Role selectors** — for each role selector message: the message, channel, and role IDs, the title/description text, each button's emoji and label, and the user ID of whoever created it. When a member clicks a button, DiVA adds or removes the role in Discord but does **not** store who clicked.
 
 ### 3.6 AI usage records
 
@@ -132,6 +133,7 @@ We do **not** add new sub-processors silently. If a new one is introduced, this 
 | Per-message token/cost records (`token_usage`) | **Indefinitely** for accounting; can be anonymized on request |
 | Server personality prompt (`guild_personality`) | Until DiVA is removed from the server, or it is reset via `/personality reset` |
 | Admin-tool audit log (`admin_tool_audit`) | **90 days**, then pruned by an hourly sweep |
+| Role selectors (`role_selectors`, `role_selector_options`) | Until the selector message is deleted (by DiVA or by hand); a deleted role is removed from its selectors immediately |
 | Database backups (Railway volume) | **10 days** rolling — older snapshots are deleted automatically |
 | Operational logs | Up to **30 days** at the hosting layer |
 

@@ -77,6 +77,7 @@ export default async function dataExport(interaction) {
             `• \`token_usage\`: ${counts.token_usage} row${counts.token_usage === 1 ? '' : 's'}`,
             `• \`admin_tool_audit\`: ${counts.admin_tool_audit} row${counts.admin_tool_audit === 1 ? '' : 's'} _(90-day retention)_`,
             counts.undo_actions > 0 ? `• \`undo_actions\`: ${counts.undo_actions} row${counts.undo_actions === 1 ? '' : 's'} _(usually empty)_` : null,
+            counts.role_selectors_created > 0 ? `• \`role_selectors_created\`: ${counts.role_selectors_created} selector${counts.role_selectors_created === 1 ? '' : 's'} you created` : null,
             '',
             'This export covers every DiVA-managed server you participate in. Server-level data (server credits, server personality, channel routing) is not included — that\'s available to server admins via `/server-data-export`.',
             '',

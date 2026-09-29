@@ -4,6 +4,11 @@ import { notifyError } from '../utils/errorNotifier.js';
 import { checkAdminRateLimit, recordAdminToolCall as recordAdminRateLimitCall } from '../utils/adminRateLimiter.js';
 import { getDb } from '../db/init.js';
 import { recordAdminToolCall as recordAdminAuditEntry } from '../db/adminAudit.js';
+import {
+    ROLE_SELECTOR_TOOL_DEFINITIONS, ROLE_SELECTOR_TOOLS, READ_ONLY_ROLE_SELECTOR_TOOLS,
+    executeRoleSelectorTool, formatRoleSelectorToolForConfirmation,
+    validateRoleSelectorTool, buildRoleSelectorPreview, undoCreatedRoleSelector,
+} from './roleSelectorTools.js';
 
 // ── Input sanitization ──
 
@@ -42,13 +47,30 @@ function validateTopic(topic) {
     return { valid: true, value: sanitizeString(topic, MAX_TOPIC_LENGTH) };
 }
 
-// ── Admin permission re-check ──
+// ── Admin permission checks ──
 
-function isStillAdmin(guild, userId) {
-    const member = guild.members.cache.get(userId);
+/**
+ * Can this member use this admin tool? Administrator / Manage Server can use
+ * everything; Manage Roles additionally unlocks the role selector tools so
+ * moderators can run self-assign roles without full server admin.
+ */
+export function canUseAdminTool(member, toolName) {
     if (!member) return false;
-    return member.permissions.has(PermissionsBitField.Flags.Administrator) ||
-           member.permissions.has(PermissionsBitField.Flags.ManageGuild);
+    if (member.permissions.has(PermissionsBitField.Flags.Administrator) ||
+        member.permissions.has(PermissionsBitField.Flags.ManageGuild)) {
+        return true;
+    }
+    return ROLE_SELECTOR_TOOLS.has(toolName) &&
+           member.permissions.has(PermissionsBitField.Flags.ManageRoles);
+}
+
+/** True if the member can use any admin tool (full admin or role selectors). */
+export function canUseAnyAdminTool(member) {
+    return canUseAdminTool(member, 'list_role_selectors');
+}
+
+function isStillAllowed(guild, userId, toolName) {
+    return canUseAdminTool(guild.members.cache.get(userId), toolName);
 }
 
 // ── Allowed tool names (server-side allowlist) ──
@@ -61,6 +83,7 @@ const ALLOWED_TOOLS = new Set([
     'edit_server', 'create_thread', 'archive_thread', 'lock_thread',
     'create_emoji', 'rename_emoji', 'create_scheduled_event',
     'set_nickname', 'list_channels', 'list_roles',
+    ...ROLE_SELECTOR_TOOLS,
 ]);
 
 // ── Permission flag name map (for natural language → PermissionFlagsBits) ──
@@ -470,11 +493,15 @@ export const ADMIN_TOOL_DEFINITIONS = [
             required: [],
         },
     },
+
+    // ═══════════════ ROLE SELECTORS (see roleSelectorTools.js) ═══════════════
+
+    ...ROLE_SELECTOR_TOOL_DEFINITIONS,
 ];
 
 // ── Read-only tools that don't need confirmation ──
 
-const READ_ONLY_TOOLS = new Set(['list_channels', 'list_roles']);
+const READ_ONLY_TOOLS = new Set(['list_channels', 'list_roles', ...READ_ONLY_ROLE_SELECTOR_TOOLS]);
 
 // ── Undo action history (in-memory, per-guild, per-user) ──
 // Map<`${guildId}:${userId}`, { actions: [...], confirmMsgId: string }>
@@ -534,13 +561,16 @@ export function cleanupExpiredUndoActions() {
  * Execute the reverse of an admin action.
  */
 export async function executeUndo(guild, userId, action) {
-    // Re-verify admin permissions
-    if (!isStillAdmin(guild, userId)) {
+    // Re-verify permissions. Undoing a role selector only needs the role selector gate.
+    const gateTool = action.type === 'created_role_selector' ? 'delete_role_selector' : null;
+    if (!isStillAllowed(guild, userId, gateTool)) {
         return { success: false, message: 'You no longer have admin permissions.' };
     }
 
     try {
         switch (action.type) {
+            case 'created_role_selector':
+                return await undoCreatedRoleSelector(guild, action);
             case 'created_channel': {
                 const channel = guild.channels.cache.get(action.channelId);
                 if (!channel) return { success: false, message: `Channel already deleted.` };
@@ -609,6 +639,7 @@ export function isReadOnlyTool(toolName) {
  * Format a tool call into a human-readable description for confirmation.
  */
 export function formatToolForConfirmation(toolName, input) {
+    if (ROLE_SELECTOR_TOOLS.has(toolName)) return formatRoleSelectorToolForConfirmation(toolName, input);
     switch (toolName) {
         case 'create_text_channel':
             return `📝 Create text channel **#${input.name}**${input.category ? ` under "${input.category}"` : ''}${input.topic ? ` — topic: "${input.topic}"` : ''}`;
@@ -704,6 +735,38 @@ function findThread(guild, name) {
     );
 }
 
+// ── Pre-confirmation hooks ──
+
+/**
+ * Pre-flight check for a write tool, run BEFORE the confirmation card. Returns
+ * an error string if the call is already known to fail (so Claude can correct
+ * it without the admin confirming a doomed action), or null.
+ * Only tools that can validate cheaply implement this; others return null.
+ */
+export async function validateAdminTool(toolName, input, guild, userId, context = {}) {
+    if (!ROLE_SELECTOR_TOOLS.has(toolName)) return null;
+    try {
+        return await validateRoleSelectorTool(toolName, input, guild, userId, context);
+    } catch (err) {
+        logger.error('Admin tool pre-flight failed', { toolName, error: err.message });
+        return null; // Let execution surface the real error.
+    }
+}
+
+/**
+ * Optional rich preview (embeds + disabled components) for the confirmation
+ * card. Returns null when the tool has no preview.
+ */
+export async function buildAdminToolPreview(toolName, input, guild, userId, context = {}) {
+    if (!ROLE_SELECTOR_TOOLS.has(toolName)) return null;
+    try {
+        return await buildRoleSelectorPreview(toolName, input, guild, userId, context);
+    } catch (err) {
+        logger.error('Admin tool preview failed', { toolName, error: err.message });
+        return null;
+    }
+}
+
 // ── Tool executor ──
 
 /**
@@ -711,11 +774,14 @@ function findThread(guild, name) {
  * write on every exit path (success, validation failure, permission denial,
  * rate-limit, or thrown error). Audit failure is swallowed inside the
  * recorder; never blocks the user-facing return.
+ *
+ * `context.channelId` is the channel the request came from — used by tools
+ * that default to "here" (e.g. create_role_selector).
  */
-export async function executeAdminTool(toolName, input, guild, userId) {
+export async function executeAdminTool(toolName, input, guild, userId, context = {}) {
     let result;
     try {
-        result = await executeAdminToolImpl(toolName, input, guild, userId);
+        result = await executeAdminToolImpl(toolName, input, guild, userId, context);
     } catch (err) {
         // Defensive — executeAdminToolImpl already has a try/catch around its
         // switch body, so this should be unreachable. If we ever get here,
@@ -737,7 +803,7 @@ export async function executeAdminTool(toolName, input, guild, userId) {
     return result;
 }
 
-async function executeAdminToolImpl(toolName, input, guild, userId) {
+async function executeAdminToolImpl(toolName, input, guild, userId, context = {}) {
     // ── Server-side allowlist check ──
     if (!ALLOWED_TOOLS.has(toolName)) {
         await notifyError({
@@ -749,8 +815,8 @@ async function executeAdminToolImpl(toolName, input, guild, userId) {
         return { success: false, message: 'That action is not available.' };
     }
 
-    // ── Re-verify admin permissions before every tool execution ──
-    if (!isStillAdmin(guild, userId)) {
+    // ── Re-verify permissions before every tool execution ──
+    if (!isStillAllowed(guild, userId, toolName)) {
         await notifyError({
             title: 'Admin permission lost during tool chain',
             error: new Error('User no longer has admin permissions'),
@@ -769,6 +835,10 @@ async function executeAdminToolImpl(toolName, input, guild, userId) {
     recordAdminRateLimitCall(guild.id);
 
     try {
+        if (ROLE_SELECTOR_TOOLS.has(toolName)) {
+            return await executeRoleSelectorTool(toolName, input, guild, userId, context);
+        }
+
         switch (toolName) {
 
             // ── Channel Creation ──

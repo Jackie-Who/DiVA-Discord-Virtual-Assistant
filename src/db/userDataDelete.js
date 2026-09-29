@@ -75,7 +75,13 @@ export function deleteUserDataInGuild(userId, guildId) {
             UPDATE admin_tool_audit SET user_id = ? WHERE user_id = ? AND guild_id = ?
         `).run(anonId, userId, guildId).changes;
 
+        // Role selectors are server content — they stay live; only authorship is anonymized.
+        const roleSelectorsAnonymized = db.prepare(`
+            UPDATE role_selectors SET created_by = ? WHERE created_by = ? AND guild_id = ?
+        `).run(anonId, userId, guildId).changes;
+
         return {
+            role_selectors_anonymized: roleSelectorsAnonymized,
             reminders_deleted: remindersDeleted,
             conversations_deleted: conversationsDeleted,
             undo_actions_deleted: undoActionsDeleted,
@@ -101,5 +107,6 @@ export function countUserDataInGuild(userId, guildId) {
         undo_actions: get(`SELECT COUNT(*) AS n FROM undo_actions WHERE user_id = ? AND guild_id = ?`),
         token_usage: get(`SELECT COUNT(*) AS n FROM token_usage WHERE user_id = ? AND guild_id = ?`),
         admin_tool_audit: get(`SELECT COUNT(*) AS n FROM admin_tool_audit WHERE user_id = ? AND guild_id = ?`),
+        role_selectors: get(`SELECT COUNT(*) AS n FROM role_selectors WHERE created_by = ? AND guild_id = ?`),
     };
 }

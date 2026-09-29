@@ -1,6 +1,6 @@
 {
   "name": "diva",
-  "version": "1.2.2",
+  "version": "1.3.0",
   "description": "DiVA — Discord Virtual Assistant. A Claude-powered Discord bot with evolving personality, admin tools, multi-model routing, reminders, and secretary mode.",
   "license": "MIT",
   "type": "module",

@@ -9,6 +9,7 @@ import { cleanupExpiredAuditEntries } from './db/adminAudit.js';
 import { initWeeklyMetrics } from './utils/weeklyMetrics.js';
 import { initReminderScheduler } from './utils/reminderScheduler.js';
 import { initSecretaryScheduler } from './utils/secretaryScheduler.js';
+import { initRoleSelectorEvents } from './utils/roleSelectors.js';
 // runUpdateNotifier is wired through ready.js so it fires after Discord login
 import ready from './events/ready.js';
 import messageCreate from './events/messageCreate.js';
@@ -65,6 +66,10 @@ initReminderScheduler(client);
 // Initialize the secretary mode daily-digest scheduler — polls every 5 min,
 // fires each opted-in user's digest within ±2.5 min of their chosen local time.
 initSecretaryScheduler(client);
+
+// Role selectors: drop DB rows when a selector message is deleted, and prune
+// deleted roles from selectors (re-rendering their buttons).
+initRoleSelectorEvents(client);
 
 // Register event handlers
 ready(client);

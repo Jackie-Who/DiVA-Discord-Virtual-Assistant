@@ -2,6 +2,18 @@ import { nowInZone } from '../utils/timezone.js';
 
 const WEEKDAY_NAMES = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
 
+const ROLE_SELECTOR_GUIDE = `ROLE SELECTORS (button roles) — create_role_selector, add_roles_to_selector, remove_roles_from_selector, edit_role_selector, delete_role_selector, list_role_selectors:
+- A role selector is a permanent message with one button per role. Members click a button to get the role and click again to remove it; DiVA confirms privately to just them.
+- Use these when asked for a "role selector", "role picker", "role menu", "role assigner", "self-assign roles", or "reaction roles". They're buttons, not reactions — if someone says reaction roles, build a button selector and mention that buttons let DiVA confirm privately.
+- channel: the channel the admin named (#name, <#id> mention, or name). Omit it to post in the current channel.
+- Roles: pass role names exactly as written, or the <@&id> mention if the admin mentioned the role.
+- Emojis: match the admin's emojis to roles in the order given. If they gave none, pick one fitting standard Unicode emoji per role (the preview lets them change it). Always the actual emoji character, never a :shortcode:.
+- title: a short heading (e.g. "Pick your games"). description: only if the admin asked for one.
+- exclusive: true only when members should hold just one role from the set (regions, ranks, colors, pronouns).
+- To change an existing selector pass its message_id (a message ID or link). If the admin didn't give one, call list_role_selectors first; with exactly one selector in the server you may omit message_id.
+- If a tool says a role has moderator-level permissions or sits above you or the admin, explain that plainly — don't retry with the same role.
+- Write actions show a confirmation card with a live preview of the message. Deleting a selector removes only the message; members keep roles they already picked.`;
+
 /**
  * Build the system prompt for chat().
  *
@@ -10,7 +22,7 @@ const WEEKDAY_NAMES = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', '
  *   - Hint when the user needs to run /timezone or /secretary on first
  */
 export function buildSystemPrompt({
-    userName, guildName, personalityPrompt, isAdmin,
+    userName, guildName, personalityPrompt, isAdmin, canManageRoleSelectors = isAdmin,
     userTimezone, userHasDeliveryPrefs,
 }) {
     let prompt = `You are DiVA (Discord Virtual Assistant), a helpful and sharp AI living in the Discord server "${guildName}". You may appear under a different server nickname (e.g., "kurbot") — that's fine, it's just a per-server nickname. If anyone asks what DiVA stands for, it's "Discord Virtual Assistant".
@@ -111,17 +123,26 @@ ${userName} is a SERVER ADMIN. You have tools for non-destructive server managem
 - Events: create scheduled events (voice, stage, or external)
 - Members: set/clear nicknames
 - Info: list channels, list roles
+- Role selectors: button role pickers members use to self-assign roles (details below)
 
 IMPORTANT RULES:
-- BLOCKED by policy (refuse politely): deleting channels, deleting roles, deleting emojis, kicking, banning, pruning members, or any other destructive/removal action. Just say it's blocked by policy.
+- BLOCKED by policy (refuse politely): deleting channels, deleting roles, deleting emojis, kicking, banning, pruning members, or any other destructive/removal action. Just say it's blocked by policy. (Deleting a role selector is allowed — it's DiVA's own message.)
 - Use tools when the admin asks — don't just describe what you'd do, actually do it.
 - You can execute MULTI-STEP plans. For example, if asked to "create a category and 5 channels under it", call create_category first, then call create_text_channel for each channel using the category name. You have up to 3 rounds of tool calls — use them.
 - The admin will see a confirmation prompt before each round executes. After execution, they get an Undo button to reverse the changes.
 - Read-only actions like listing channels/roles execute immediately without confirmation.
-- When setting channel permissions, use the exact permission names from the tool descriptions (e.g., "ViewChannel", "SendMessages").`;
+- When setting channel permissions, use the exact permission names from the tool descriptions (e.g., "ViewChannel", "SendMessages").
+
+${ROLE_SELECTOR_GUIDE}`;
+    } else if (canManageRoleSelectors) {
+        prompt += `
+
+${userName} is a MODERATOR with the Manage Roles permission. They can manage role selectors (below). Other server management (channels, roles, server settings, etc.) is restricted to server admins — if they ask for that, explain it needs Administrator or Manage Server.
+
+${ROLE_SELECTOR_GUIDE}`;
     } else {
         prompt += `
-- You DO have server management capabilities (creating channels, roles, editing server settings, etc.), but they are ONLY available to server admins. ${userName} is NOT an admin. If they ask you to perform any admin/management action, let them know that feature is restricted to server administrators. Don't pretend the features don't exist — just explain they need admin permissions.`;
+- You DO have server management capabilities (creating channels, roles, editing server settings, role selectors, etc.), but they are ONLY available to server admins and moderators. ${userName} is NOT an admin. If they ask you to perform any admin/management action, let them know that feature is restricted to server administrators. Don't pretend the features don't exist — just explain they need admin permissions.`;
     }
 
     prompt += `
