@@ -109,6 +109,32 @@ const commands = [
             sub.setName('off').setDescription('Disable update notices')
         )
         .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
+
+    new SlashCommandBuilder()
+        .setName('admin-audit')
+        .setDescription('Show recent admin-tool actions taken by DiVA in this server (last 90 days)')
+        .addUserOption(opt =>
+            opt.setName('user').setDescription('Filter to actions taken on behalf of a specific member')
+        )
+        .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
+
+    new SlashCommandBuilder()
+        .setName('data-export')
+        .setDescription('Download a JSON copy of every DiVA database row linked to your Discord account'),
+
+    new SlashCommandBuilder()
+        .setName('data-delete')
+        .setDescription('Delete your DiVA data for this server only (your data in other servers is unaffected)'),
+
+    new SlashCommandBuilder()
+        .setName('server-data-export')
+        .setDescription('Download a JSON copy of all DiVA server-level data for this guild')
+        .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
+
+    new SlashCommandBuilder()
+        .setName('server-data-delete')
+        .setDescription('Reset server-level config (personality + channel routing). Credits + user data untouched.')
+        .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
 ];
 
 const rest = new REST({ version: '10' }).setToken(config.discordToken);

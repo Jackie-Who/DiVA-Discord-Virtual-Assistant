@@ -7,7 +7,13 @@ import timezone from '../commands/timezone.js';
 import reminder from '../commands/reminder.js';
 import secretary from '../commands/secretary.js';
 import personality from '../commands/personality.js';
+import adminAudit from '../commands/adminAudit.js';
+import dataExport from '../commands/dataExport.js';
+import dataDelete from '../commands/dataDelete.js';
+import serverDataExport from '../commands/serverDataExport.js';
+import serverDataDelete from '../commands/serverDataDelete.js';
 import { handlePreFireButton } from '../utils/reminderScheduler.js';
+import { handleRoleSelectorButton, BUTTON_ID_PREFIX as ROLE_SELECTOR_PREFIX } from '../utils/roleSelectors.js';
 
 // Note: as of v1.2 we removed /create-channel, /delete-channel, /ban, /kick, /purge —
 // Discord's native UI handles those better, and the bot's natural-language admin
@@ -22,10 +28,36 @@ const commands = {
     reminder,
     secretary,
     personality,
+    'admin-audit': adminAudit,
+    'data-export': dataExport,
+    'data-delete': dataDelete,
+    'server-data-export': serverDataExport,
+    'server-data-delete': serverDataDelete,
 };
 
 export default function interactionCreate(client) {
     client.on('interactionCreate', async (interaction) => {
+        // Role selector buttons. Routed globally (like pre-fire buttons) so the
+        // selector keeps working forever, across restarts.
+        if (interaction.isButton() && interaction.customId.startsWith(ROLE_SELECTOR_PREFIX)) {
+            try {
+                await handleRoleSelectorButton(interaction);
+            } catch (error) {
+                logger.error('Role selector button error', {
+                    customId: interaction.customId,
+                    user: interaction.user.id,
+                    error: error.message,
+                    stack: error.stack,
+                });
+                const reply = { content: 'Something went wrong updating your roles.', ephemeral: true };
+                try {
+                    if (interaction.deferred || interaction.replied) await interaction.editReply(reply);
+                    else await interaction.reply(reply);
+                } catch {}
+            }
+            return;
+        }
+
         // Pre-fire reminder buttons (Snooze / Dismiss). Routed globally so they
         // survive bot restarts — the message-component collector pattern doesn't
         // work for the 1-hour pre-fire window.

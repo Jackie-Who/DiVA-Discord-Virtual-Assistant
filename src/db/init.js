@@ -174,6 +174,63 @@ function initTables() {
             value TEXT NOT NULL,
             updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
         );
+
+        -- ── v1.2.2 tables ──
+
+        -- Audit trail for every admin-tool execution (success or failure).
+        -- Used for abuse investigation and the /admin-audit slash command.
+        -- Retention: 90 days (sweep alongside undo_actions cleanup).
+        -- input_json is capped at INPUT_JSON_MAX_LEN bytes to bound storage and
+        -- avoid persisting unbounded user content (channel topics, role names, etc).
+        CREATE TABLE IF NOT EXISTS admin_tool_audit (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            guild_id TEXT NOT NULL,
+            user_id TEXT NOT NULL,
+            tool_name TEXT NOT NULL,
+            input_json TEXT,
+            success INTEGER NOT NULL,
+            error_message TEXT,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_admin_audit_guild
+        ON admin_tool_audit(guild_id, created_at DESC);
+
+        CREATE INDEX IF NOT EXISTS idx_admin_audit_user
+        ON admin_tool_audit(user_id, created_at DESC);
+
+        -- ── v1.3 tables ──
+
+        -- Button role selectors. One row per live selector message; the message
+        -- ID is the key because that's what admins reference ("add a role to
+        -- 1234...") and what the button router sees on every click.
+        CREATE TABLE IF NOT EXISTS role_selectors (
+            message_id TEXT PRIMARY KEY,
+            guild_id TEXT NOT NULL,
+            channel_id TEXT NOT NULL,
+            title TEXT NOT NULL,
+            description TEXT,
+            exclusive INTEGER NOT NULL DEFAULT 0,
+            created_by TEXT NOT NULL,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_role_selectors_guild
+        ON role_selectors(guild_id);
+
+        -- One row per role button on a selector. position controls button order.
+        CREATE TABLE IF NOT EXISTS role_selector_options (
+            message_id TEXT NOT NULL REFERENCES role_selectors(message_id) ON DELETE CASCADE,
+            role_id TEXT NOT NULL,
+            emoji TEXT,
+            label TEXT NOT NULL,
+            position INTEGER NOT NULL,
+            PRIMARY KEY (message_id, role_id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_role_selector_options_role
+        ON role_selector_options(role_id);
     `);
 
     runMigrations();

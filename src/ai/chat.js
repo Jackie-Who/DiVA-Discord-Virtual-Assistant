@@ -5,7 +5,8 @@ import { getPersonality, incrementInteractionCount, shouldRunDigest } from '../d
 import { getUserSettings } from '../db/userSettings.js';
 import { isGuildOutOfCredits, isGuildInSavingMode, getGuildSpendPercent, recordUsage } from '../db/tokenBudget.js';
 import { runPersonalityDigest } from './personality.js';
-import { ADMIN_TOOL_DEFINITIONS, executeAdminTool, isReadOnlyTool, formatToolForConfirmation, recordUndoableAction, getUndoableActions, clearUndoActions, executeUndo } from './adminTools.js';
+import { ADMIN_TOOL_DEFINITIONS, executeAdminTool, isReadOnlyTool, formatToolForConfirmation, recordUndoableAction, getUndoableActions, clearUndoActions, executeUndo, canUseAdminTool, canUseAnyAdminTool, validateAdminTool, buildAdminToolPreview } from './adminTools.js';
+import { ROLE_SELECTOR_TOOL_DEFINITIONS } from './roleSelectorTools.js';
 import { USER_TOOL_DEFINITIONS, executeUserTool, isUserTool, isReadOnlyUserTool, formatUserToolForConfirmation, shouldSkipConfirmation } from './userTools.js';
 import config from '../config.js';
 import logger from '../utils/logger.js';
@@ -169,6 +170,18 @@ async function requestToolConfirmation(message, toolBlocks) {
         ? `I'll perform the following action:\n\n${actionLines[0]}`
         : `I'll perform the following **${actionLines.length} actions**:\n\n${actionLines.join('\n')}`;
 
+    // Rich previews (e.g. the exact role selector message about to be posted).
+    // Preview buttons are disabled; they're only shown when a single preview
+    // fits alongside the Confirm/Cancel row (Discord allows 5 rows total).
+    const previews = [];
+    for (const b of toolBlocks) {
+        if (isUserTool(b.name)) continue;
+        const preview = await buildAdminToolPreview(b.name, b.input, message.guild, userId, { channelId: message.channel.id });
+        if (preview) previews.push(preview);
+    }
+    const previewEmbeds = previews.flatMap(p => p.embeds).slice(0, 10);
+    const previewRows = previews.length === 1 && previews[0].components.length <= 4 ? previews[0].components : [];
+
     const ts = Date.now();
     const confirmId = `confirm_${message.id}_${ts}`;
     const cancelId = `cancel_${message.id}_${ts}`;
@@ -188,7 +201,9 @@ async function requestToolConfirmation(message, toolBlocks) {
 
     const confirmMsg = await message.reply({
         content: description + `\n\n*Waiting for confirmation... (expires <t:${Math.floor((ts + CONFIRMATION_TIMEOUT_MS) / 1000)}:R>)*`,
-        components: [row],
+        embeds: previewEmbeds,
+        components: [...previewRows, row],
+        allowedMentions: { parse: [], repliedUser: true },
     });
 
     try {
@@ -296,6 +311,9 @@ export async function chat(message, client) {
     const userName = message.author.displayName || message.author.username;
     const guildName = message.guild.name;
     const memberIsAdmin = isAdmin(message.member);
+    // Manage Roles members (moderators) get the role selector tools only.
+    const memberCanManageSelectors = canUseAnyAdminTool(message.member);
+    const toolContext = { channelId };
 
     // Out-of-credits is handled in messageCreate.js (with the 24h notice cooldown).
     // chat() is only called when the guild still has credits.
@@ -350,6 +368,7 @@ export async function chat(message, client) {
         guildName,
         personalityPrompt,
         isAdmin: memberIsAdmin,
+        canManageRoleSelectors: memberCanManageSelectors,
         userTimezone: userSettings.timezone,
         userHasDeliveryPrefs: !!userSettings.deliveryMode,
     }) + channelMemoryText;
@@ -378,20 +397,24 @@ export async function chat(message, client) {
     // User tools (reminders) are available to EVERYONE.
     tools.push(...USER_TOOL_DEFINITIONS);
 
-    // Admin tools layered on top for admins.
+    // Admin tools layered on top for admins; moderators with Manage Roles get
+    // just the role selector tools.
     if (memberIsAdmin) {
         tools.push(...ADMIN_TOOL_DEFINITIONS);
+    } else if (memberCanManageSelectors) {
+        tools.push(...ROLE_SELECTOR_TOOL_DEFINITIONS);
     }
 
     try {
         // Use higher max_tokens for admin requests to allow multi-step tool plans
-        const effectiveMaxTokens = memberIsAdmin ? ADMIN_MAX_TOKENS : config.maxResponseTokens;
+        const effectiveMaxTokens = memberCanManageSelectors ? ADMIN_MAX_TOKENS : config.maxResponseTokens;
 
-        // Route to cheaper model for simple messages
+        // Route to cheaper model for simple messages. Moderators only get
+        // Sonnet when they're talking about roles / selectors.
         const selectedModel = chooseModel({
             text: userContent,
             hasImages: allImages.length > 0,
-            isAdmin: memberIsAdmin,
+            isAdmin: memberIsAdmin || (memberCanManageSelectors && /\brole|selector|picker\b/i.test(userContent)),
             hasTools: tools.length > 1, // more than just web_search
         });
 
@@ -464,8 +487,8 @@ export async function chat(message, client) {
             const adminBlocks = customBlocks.filter(b => !isUserTool(b.name));
             const userBlocks = customBlocks.filter(b => isUserTool(b.name));
 
-            // If a non-admin somehow triggered an admin tool block, refuse politely
-            if (adminBlocks.length > 0 && !memberIsAdmin) {
+            // If the member triggered an admin tool they aren't allowed to use, refuse politely
+            if (adminBlocks.some(b => !canUseAdminTool(message.member, b.name))) {
                 messages.push({ role: 'assistant', content: response.content });
                 messages.push({ role: 'user', content: adminBlocks.map(b => ({
                     type: 'tool_result',
@@ -513,7 +536,7 @@ export async function chat(message, client) {
 
             // Execute read-only tools immediately (always safe, never blocked)
             for (const toolUse of adminReadOnly) {
-                const result = await executeAdminTool(toolUse.name, toolUse.input, message.guild, userId);
+                const result = await executeAdminTool(toolUse.name, toolUse.input, message.guild, userId, toolContext);
                 toolResults.push({
                     type: 'tool_result',
                     tool_use_id: toolUse.id,
@@ -574,20 +597,40 @@ export async function chat(message, client) {
                     if (result.success) executedWriteKeys.add(writeKeyFor(toolUse.name, toolUse.input));
                 }
 
+                // Pre-flight: admin writes that are already known to fail (bad
+                // emoji, unassignable role, ...) return an error to Claude so it
+                // can correct them, instead of putting a doomed action on the card.
+                const confirmableBlocks = [];
+                for (const toolUse of allowedWriteBlocks) {
+                    const preflightError = isUserTool(toolUse.name)
+                        ? null
+                        : await validateAdminTool(toolUse.name, toolUse.input, message.guild, userId, toolContext);
+                    if (preflightError) {
+                        toolResults.push({
+                            type: 'tool_result',
+                            tool_use_id: toolUse.id,
+                            content: preflightError,
+                            is_error: true,
+                        });
+                    } else {
+                        confirmableBlocks.push(toolUse);
+                    }
+                }
+
                 // Write tools need confirmation (single combined card if mixed admin + user)
-                if (allowedWriteBlocks.length > 0) {
-                    const { confirmed, confirmMsgId, confirmMsg: cMsg, description } = await requestToolConfirmation(message, allowedWriteBlocks);
+                if (confirmableBlocks.length > 0) {
+                    const { confirmed, confirmMsgId, confirmMsg: cMsg, description } = await requestToolConfirmation(message, confirmableBlocks);
 
                     if (confirmed) {
                         let hasUndoableActions = false;
 
-                        for (const toolUse of allowedWriteBlocks) {
+                        for (const toolUse of confirmableBlocks) {
                             let result;
                             if (isUserTool(toolUse.name)) {
                                 result = await executeUserTool(toolUse.name, toolUse.input, message, userId);
                                 if (result.aiSuggestion) aiSuggestions.push(result.aiSuggestion);
                             } else {
-                                result = await executeAdminTool(toolUse.name, toolUse.input, message.guild, userId);
+                                result = await executeAdminTool(toolUse.name, toolUse.input, message.guild, userId, toolContext);
                                 recordAdminToolCall(guildId);
 
                                 // Only admin tools have undo metadata
@@ -624,7 +667,7 @@ export async function chat(message, client) {
                         // User cancelled or timed out. Push tool_results so Claude can wrap up
                         // with text. Track signatures of cancelled writes so Claude doesn't
                         // immediately retry the same one (treats cancel like "completed" for safeguard).
-                        for (const toolUse of allowedWriteBlocks) {
+                        for (const toolUse of confirmableBlocks) {
                             toolResults.push({
                                 type: 'tool_result',
                                 tool_use_id: toolUse.id,
@@ -633,7 +676,7 @@ export async function chat(message, client) {
                             executedWriteKeys.add(writeKeyFor(toolUse.name, toolUse.input));
                         }
                     }
-                } // close: if (allowedWriteBlocks.length > 0) — confirmation flow
+                } // close: if (confirmableBlocks.length > 0) — confirmation flow
             }
 
             if (toolResults.length === 0) break;
